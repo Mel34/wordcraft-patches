@@ -1,0 +1,216 @@
+From cdaac39caa59d093abd540daebbe31c798c92530 Mon Sep 17 00:00:00 2001
+From: Mel <pmargeti34@gmail.com>
+Date: Mon, 19 Oct 2026 17:03:14 +0800
+Subject: [PATCH 1/2] Add native-style Linux window controls
+
+---
+ apps/wordcraft/src/main.rs   |   4 ++
+ crates/ui-egui/src/chrome.rs | 123 ++++++++++++++++++++++++++++++++++-
+ crates/ui-egui/src/lib.rs    |   4 ++
+ 3 files changed, 130 insertions(+), 1 deletion(-)
+
+diff --git a/apps/wordcraft/src/main.rs b/apps/wordcraft/src/main.rs
+index e7b53301..68b33d59 100644
+--- a/apps/wordcraft/src/main.rs
++++ b/apps/wordcraft/src/main.rs
+@@ -369,6 +369,8 @@ fn main() -> eframe::Result {
+             None => logger.no_file(),
+         }
+     }
++    let window_controls = cfg!(not(any(target_os = "macos", target_os = "windows")))
++        && std::env::var_os("WORDCRAFT_SYSTEM_TITLEBAR").is_none();
+     let mut options = eframe::NativeOptions {
+         viewport: egui::ViewportBuilder::default()
+             .with_title("WordCraft")
+@@ -376,6 +378,7 @@ fn main() -> eframe::Result {
+             .with_inner_size([1440.0, 920.0])
+             .with_min_inner_size([760.0, 480.0])
+             .with_drag_and_drop(true)
++            .with_decorations(!window_controls)
+             .with_fullsize_content_view(true)
+             .with_titlebar_shown(false)
+             .with_title_shown(false),
+@@ -441,6 +444,7 @@ fn main() -> eframe::Result {
+             }
+             app.ui.window = restored;
+             app.integrated_titlebar = cfg!(target_os = "macos");
++            app.window_controls = window_controls;
+             #[cfg(target_os = "macos")]
+             if let Some(bar) = traffic_lights::title_bar() {
+                 log::info!("title bar: {bar:?}");
+diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
+index c057992e..01bda6a6 100644
+--- a/crates/ui-egui/src/chrome.rs
++++ b/crates/ui-egui/src/chrome.rs
+@@ -1,6 +1,6 @@
+ //! Title bar (Quick Access Toolbar, title, search, account) and status bar.
+ 
+-use egui::{Align2, Rect, Sense, Stroke, Ui, pos2, vec2};
++use egui::{Align2, CursorIcon, Rect, ResizeDirection, Sense, Stroke, Ui, ViewportCommand, pos2, vec2};
+ use serde_json::json;
+ use wordcraft_doc::StoryRef;
+ 
+@@ -283,6 +283,9 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
+                 quick_access(ui, app);
+                 qat_end = ui.min_rect().max.x;
+                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                    if app.window_controls {
++                        ui.add_space(3.0 * CONTROL_W);
++                    }
+                     // Account / community.
+                     let (r, resp) = ui.allocate_exact_size(vec2(control_h, control_h), Sense::click());
+                     ui.painter().circle_filled(r.center(), control_h / 2.0 - 1.0, t.accent);
+@@ -394,6 +397,124 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
+         });
+ }
+ 
++/// Width of one window-control button on the title bar.
++const CONTROL_W: f32 = 46.0;
++/// Height of the title bar, and of the window-control buttons.
++const TITLE_H: f32 = 38.0;
++/// How far in from a frameless window's edge the pointer resizes it.
++const RESIZE_BAND: f32 = 5.0;
++/// How far along an edge from a corner the pointer resizes diagonally.
++const RESIZE_CORNER: f32 = 14.0;
++
++/// A frameless window (`WordApp::window_controls`): minimize, maximize/restore and close at the
++/// top right, resizing from the edges and corners, and a hairline border. Drawn above everything,
++/// so the controls stay reachable from Backstage too.
++pub fn window_frame(app: &WordApp, ctx: &egui::Context) {
++    if !app.window_controls {
++        return;
++    }
++    let (maximized, fullscreen) = ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
++    if fullscreen {
++        return;
++    }
++    let t = Tokens::get(ctx);
++    let screen = ctx.content_rect();
++    let controls = Rect::from_min_size(pos2(screen.max.x - 3.0 * CONTROL_W, screen.min.y), vec2(3.0 * CONTROL_W, TITLE_H));
++    egui::Area::new(egui::Id::new("wc_window_controls")).order(egui::Order::Foreground).fixed_pos(controls.min).show(ctx, |ui| {
++        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
++        ui.horizontal(|ui| {
++            for kind in ["minimize", "maximize", "close"] {
++                let (r, resp) = ui.allocate_exact_size(vec2(CONTROL_W, TITLE_H), Sense::click());
++                let close = kind == "close";
++                let hot = resp.hovered() || resp.is_pointer_button_down_on();
++                let c = if close && hot {
++                    ui.painter().rect_filled(r, 0.0, egui::Color32::from_rgb(0xC4, 0x2B, 0x1C));
++                    egui::Color32::WHITE
++                } else {
++                    if hot {
++                        ui.painter().rect_filled(r, 0.0, if resp.is_pointer_button_down_on() { t.pressed } else { t.hover });
++                    }
++                    t.icon
++                };
++                let stroke = Stroke::new(1.0, c);
++                let m = r.center();
++                let p = ui.painter();
++                let tip = match kind {
++                    "minimize" => {
++                        p.line_segment([pos2(m.x - 5.0, m.y), pos2(m.x + 5.0, m.y)], stroke);
++                        tl!("Minimize")
++                    }
++                    "maximize" if maximized => {
++                        let front = Rect::from_min_size(pos2(m.x - 5.0, m.y - 3.0), vec2(8.0, 8.0));
++                        p.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
++                        p.line_segment([pos2(m.x - 3.0, m.y - 5.0), pos2(m.x + 5.0, m.y - 5.0)], stroke);
++                        p.line_segment([pos2(m.x + 5.0, m.y - 5.0), pos2(m.x + 5.0, m.y + 3.0)], stroke);
++                        tl!("Restore Down")
++                    }
++                    "maximize" => {
++                        p.rect_stroke(Rect::from_center_size(m, vec2(10.0, 10.0)), 0.0, stroke, egui::StrokeKind::Inside);
++                        tl!("Maximize")
++                    }
++                    _ => {
++                        p.line_segment([pos2(m.x - 5.0, m.y - 5.0), pos2(m.x + 5.0, m.y + 5.0)], stroke);
++                        p.line_segment([pos2(m.x - 5.0, m.y + 5.0), pos2(m.x + 5.0, m.y - 5.0)], stroke);
++                        tl!("Close")
++                    }
++                };
++                if resp.on_hover_text(tip).clicked() {
++                    ctx.send_viewport_cmd(match kind {
++                        "minimize" => ViewportCommand::Minimized(true),
++                        "maximize" => ViewportCommand::Maximized(!maximized),
++                        _ => ViewportCommand::Close,
++                    });
++                }
++            }
++        });
++    });
++    if maximized {
++        return;
++    }
++    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("wc_window_border"))).rect_stroke(
++        screen,
++        0.0,
++        Stroke::new(1.0, t.border),
++        egui::StrokeKind::Inside,
++    );
++    let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else { return };
++    if !screen.contains(pos) {
++        return;
++    }
++    let near = |d: f32, band: f32| d < band;
++    let (dl, dr, dt, db) = (pos.x - screen.min.x, screen.max.x - pos.x, pos.y - screen.min.y, screen.max.y - pos.y);
++    let (w, e, n, s) = (near(dl, RESIZE_BAND), near(dr, RESIZE_BAND), near(dt, RESIZE_BAND), near(db, RESIZE_BAND));
++    let (cw, ce, cn, cs) = (near(dl, RESIZE_CORNER), near(dr, RESIZE_CORNER), near(dt, RESIZE_CORNER), near(db, RESIZE_CORNER));
++    let hit = if (n && cw) || (w && cn) {
++        Some((ResizeDirection::NorthWest, CursorIcon::ResizeNorthWest))
++    } else if (n && ce) || (e && cn) {
++        Some((ResizeDirection::NorthEast, CursorIcon::ResizeNorthEast))
++    } else if (s && cw) || (w && cs) {
++        Some((ResizeDirection::SouthWest, CursorIcon::ResizeSouthWest))
++    } else if (s && ce) || (e && cs) {
++        Some((ResizeDirection::SouthEast, CursorIcon::ResizeSouthEast))
++    } else if n {
++        Some((ResizeDirection::North, CursorIcon::ResizeNorth))
++    } else if s {
++        Some((ResizeDirection::South, CursorIcon::ResizeSouth))
++    } else if w {
++        Some((ResizeDirection::West, CursorIcon::ResizeWest))
++    } else if e {
++        Some((ResizeDirection::East, CursorIcon::ResizeEast))
++    } else {
++        None
++    };
++    if let Some((dir, icon)) = hit {
++        ctx.set_cursor_icon(icon);
++        if ctx.input(|i| i.pointer.primary_pressed()) {
++            ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
++        }
++    }
++}
++
+ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
+     let t = Tokens::get(ui.ctx());
+     egui::Panel::bottom("status")
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 662516fb..da83005c 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -448,6 +448,8 @@ pub struct WordApp {
+     pub integrated_titlebar: bool,
+     /// macOS: the title bar's height and where its content starts, around the traffic lights.
+     pub mac_titlebar: chrome::MacTitleBar,
++    /// Linux: draw window controls in the application's title bar.
++    pub window_controls: bool,
+     control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
+     shot_token: u64,
+     queued_shots: Vec<(u64, f64, u32)>,
+@@ -585,6 +587,7 @@ impl WordApp {
+             previews: previews::Previews::default(),
+             integrated_titlebar: false,
+             mac_titlebar: chrome::MacTitleBar::default(),
++            window_controls: false,
+             control_rx: None,
+             shot_token: 0,
+             queued_shots: Vec::new(),
+@@ -2029,6 +2032,7 @@ impl WordApp {
+         read_aloud::show(self, &ctx);
+         crate::keytips::show(self, &ctx, ui);
+         keys::global_shortcuts(self, &ctx);
++        chrome::window_frame(self, &ctx);
+         self.refocus_after_chrome_click(&ctx);
+         if let Some(url) = self.canvas.open_url.take() {
+             ctx.open_url(egui::OpenUrl::new_tab(url));
