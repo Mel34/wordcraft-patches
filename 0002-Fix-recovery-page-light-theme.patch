@@ -1,0 +1,90 @@
+From 2687875848bc3842e6145deb30d55669cab1d0ef Mon Sep 17 00:00:00 2001
+From: Mel <pmargeti34@gmail.com>
+Date: Mon, 19 Oct 2026 17:30:33 +0800
+Subject: [PATCH 2/2] Fix recovery page light theme
+
+---
+ crates/ui-egui/src/backstage.rs | 42 +++++++++++++++++++++++++++++----
+ 1 file changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/crates/ui-egui/src/backstage.rs b/crates/ui-egui/src/backstage.rs
+index b89665ad..a3f8f432 100644
+--- a/crates/ui-egui/src/backstage.rs
++++ b/crates/ui-egui/src/backstage.rs
+@@ -22,7 +22,6 @@ const PAGES: [(&str, &str); 11] = [
+ 
+ pub fn show(app: &mut WordApp, ui: &mut Ui) {
+     let t = Tokens::get(ui.ctx());
+-    let recovery = app.ui.backstage_page == "recover";
+     // No document open (#1129): only the pages that open or create one, and Options.
+     let has_document = app.has_document();
+     if !has_document && !works_without_document(&app.ui.backstage_page) {
+@@ -33,7 +32,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
+         .exact_size(200.0)
+         // Fixed width, as in Word: without this egui shows a resize handle that does nothing (#502).
+         .resizable(false)
+-        .frame(egui::Frame::NONE.fill(if recovery { egui::Color32::BLACK } else { APP_COLOR }).inner_margin(egui::Margin {
++        .frame(egui::Frame::NONE.fill(APP_COLOR).inner_margin(egui::Margin {
+             left: 0,
+             right: 0,
+             top: if mac { 0 } else { 12 },
+@@ -136,7 +135,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
+             });
+         });
+     egui::CentralPanel::default()
+-        .frame(egui::Frame::NONE.fill(if recovery { egui::Color32::BLACK } else { t.ribbon }).inner_margin(egui::Margin::symmetric(40, 30)))
++        .frame(egui::Frame::NONE.fill(t.ribbon).inner_margin(egui::Margin::symmetric(40, 30)))
+         .show(ui, |ui| {
+             // The Print page fills the pane and scrolls its settings and its preview itself (#1156).
+             if app.ui.backstage_page == "print" {
+@@ -159,7 +158,6 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
+ 
+ /// Recovery is a separate copy. Leaving this page never discards it.
+ fn recovery_page(app: &mut WordApp, ui: &mut Ui) {
+-    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+     heading(ui, "Recover documents");
+     ui.label(tl!("Restore opens an unsaved copy. Your original file stays unchanged."));
+     ui.add_space(20.0);
+@@ -539,6 +537,42 @@ mod tests {
+         h.run_steps(4);
+     }
+ 
++    /// #2348: Recover must use the selected theme and keep its button labels readable.
++    #[test]
++    #[cfg(not(target_arch = "wasm32"))]
++    fn recovery_page_wears_the_theme() {
++        let (app, root) = recovery_app();
++        let mut h = recovery_harness(app);
++        settle_recovery(&mut h);
++        assert!(h.state().ui.backstage && h.state().ui.backstage_page == "recover");
++        assert!(!h.ctx.global_style().visuals.dark_mode, "the light theme");
++
++        let button = h.get_by_label("Continue without restoring").rect();
++        let img = h.render().unwrap();
++        let ppp = h.ctx.pixels_per_point();
++        let px = |p: egui::Pos2| img.get_pixel((p.x * ppp) as u32, (p.y * ppp) as u32).0;
++
++        let ribbon = crate::theme::Tokens::light().ribbon;
++        let [r, g, b, _] = px(egui::pos2(1400.0, 860.0));
++        assert_eq!(
++            [r, g, b],
++            [ribbon.r(), ribbon.g(), ribbon.b()],
++            "the page background matches the light theme, not black",
++        );
++
++        let dark_pixels = (button.min.y as u32..button.max.y as u32)
++            .flat_map(|y| (button.min.x as u32..button.max.x as u32).map(move |x| (x, y)))
++            .filter(|&(x, y)| px(egui::pos2(x as f32, y as f32))[..3].iter().all(|&c| c < 120))
++            .count();
++        assert!(
++            dark_pixels > 20,
++            "the button label has dark pixels on its light fill ({dark_pixels} dark pixels)",
++        );
++
++        drop(h);
++        let _ = std::fs::remove_dir_all(root);
++    }
++
+     #[test]
+     #[cfg(not(target_arch = "wasm32"))]
+     fn recovery_page_keeps_dismissed_copies_and_confirms_discard() {
