@@ -1,0 +1,1820 @@
+From 2e0c4bf40a9154b4eea5ff40a93c6a52b40975d3 Mon Sep 17 00:00:00 2001
+From: bmh129 <11478682+bmh129@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 18:23:51 -0500
+Subject: [PATCH 1/7] Linux: fall back to native Wayland when the X11 libraries
+ are missing
+
+The deb and rpm only recommend libX11 and friends, but the app forced the
+X11 backend whenever DISPLAY was set (XWayland, for file drag-and-drop), so
+a Wayland desktop without them (weak dependencies skipped, minimal or
+atomic installs) failed to start. Check that winit's X11 libraries load
+before choosing XWayland, and otherwise run natively on Wayland.
+
+The rpm also never listed libX11-xcb, which winit opens and which Fedora
+ships as its own package; add it to the recommendations.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                 |  1 +
+ apps/wordcraft/Cargo.toml  |  3 +++
+ apps/wordcraft/src/main.rs | 19 +++++++++++++++++--
+ packaging/linux/nfpm.yaml  |  4 +++-
+ 4 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 31028fe10a..65b6cffb6d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5159,6 +5159,7 @@ dependencies = [
+  "wordcraft-fonts",
+  "wordcraft-proof",
+  "wordcraft-ui-egui",
++ "x11-dl",
+  "zbus",
+ ]
+ 
+diff --git a/apps/wordcraft/Cargo.toml b/apps/wordcraft/Cargo.toml
+index 40e0d7a9c1..f4fc5c3d97 100644
+--- a/apps/wordcraft/Cargo.toml
++++ b/apps/wordcraft/Cargo.toml
+@@ -50,6 +50,9 @@ dispatch2 = "0.3"
+ 
+ [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ winit = { version = "0.30", default-features = false, features = ["x11"] }
++# Checks that the X11 libraries are installed before choosing XWayland (see main.rs). Already in
++# the build through winit, at this version.
++x11-dl = "2.21"
+ # The desktop's animation setting on Linux and the BSDs, read from the XDG settings portal over
+ # D-Bus. Already in the build through AccessKit, at this version; this adds only its blocking API.
+ zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+diff --git a/apps/wordcraft/src/main.rs b/apps/wordcraft/src/main.rs
+index db5b2488ac..f3778068de 100644
+--- a/apps/wordcraft/src/main.rs
++++ b/apps/wordcraft/src/main.rs
+@@ -263,6 +263,20 @@ fn app_icon() -> Option<egui::IconData> {
+     eframe::icon_data::from_png_bytes(png).map_err(|e| log::warn!("app icon: {e}")).ok()
+ }
+ 
++/// Whether the libraries winit's X11 backend opens at startup are installed (libX11, libXcursor,
++/// libX11-xcb and libXi; libX11-xcb brings in libxcb). The deb and rpm only recommend them, and a
++/// forced X11 backend without them fails to start.
++#[cfg(all(unix, not(target_os = "macos")))]
++fn x11_libraries_load() -> bool {
++    use x11_dl::{xcursor::Xcursor, xinput2::XInput2, xlib::Xlib, xlib_xcb::Xlib_xcb};
++    let missing = [Xlib::open().err(), Xcursor::open().err(), Xlib_xcb::open().err(), XInput2::open().err()];
++    let missing: Vec<String> = missing.into_iter().flatten().map(|e| e.to_string()).collect();
++    if !missing.is_empty() {
++        log::warn!("X11 libraries missing, using the native Wayland backend: {}", missing.join("; "));
++    }
++    missing.is_empty()
++}
++
+ const USAGE: &str = "\
+ wordcraft — the WordCraft desktop app
+ 
+@@ -400,8 +414,9 @@ fn main() -> eframe::Result {
+     #[cfg(all(unix, not(target_os = "macos")))]
+     // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
+     // manager showed a "no" cursor. Run through XWayland when it's there; WORDCRAFT_WAYLAND=1
+-    // keeps the native Wayland backend.
+-    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_WAYLAND").is_none() {
++    // keeps the native Wayland backend. The X11 libraries are only recommended by the packages,
++    // so without them a Wayland desktop gets the native backend instead of a failed start.
++    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_WAYLAND").is_none() && x11_libraries_load() {
+         options.event_loop_builder = Some(Box::new(|b| {
+             use winit::platform::x11::EventLoopBuilderExtX11;
+             b.with_x11();
+diff --git a/packaging/linux/nfpm.yaml b/packaging/linux/nfpm.yaml
+index bf75ccc1eb..9eb1e51706 100644
+--- a/packaging/linux/nfpm.yaml
++++ b/packaging/linux/nfpm.yaml
+@@ -24,7 +24,8 @@ description: |-
+ 
+ # The binaries link only glibc and libgcc_s directly. Windowing (X11/Wayland, xkbcommon) and the
+ # GPU (Vulkan, EGL/GL) are loaded at runtime, so they are dependencies/recommendations here
+-# rather than ELF NEEDED entries.
++# rather than ELF NEEDED entries. Without the X11 libraries the app runs on native Wayland
++# (no file drag-and-drop there with winit 0.30), so they are recommendations.
+ overrides:
+   deb:
+     depends:
+@@ -48,6 +49,7 @@ overrides:
+     recommends:
+       - libwayland-client
+       - libX11
++      - libX11-xcb
+       - libXcursor
+       - libXi
+       - libXrandr
+
+From f06b170c72e4b3db7cacc1ac898668cec3154b68 Mon Sep 17 00:00:00 2001
+From: bmh129 <11478682+bmh129@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:10:32 -0500
+Subject: [PATCH 2/7] Linux: default to the native Wayland backend;
+ WORDCRAFT_X11=1 for XWayland
+
+XWayland was the default on Wayland desktops only for file drag-and-drop,
+which winit 0.30 supports on X11 alone (#220). It costs blurry or oversized
+windows at fractional scales (#1382, #68), broken input methods over XIM
+(#2932, #2933, #1169) and wrongly sized dialogs (#1240), and needs the X11
+libraries installed. Let winit pick native Wayland, and make XWayland the
+opt-in: WORDCRAFT_X11=1, still ignored when the X11 libraries are missing.
+WORDCRAFT_WAYLAND=1 is now the default and has no effect.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                  | 11 ++++++-----
+ apps/wordcraft/src/main.rs | 12 ++++++------
+ packaging/linux/nfpm.yaml  |  4 ++--
+ 3 files changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/README.md b/README.md
+index cefca8f1ef..b2ebbc7543 100644
+--- a/README.md
++++ b/README.md
+@@ -278,13 +278,14 @@ adapter. The log file records the choice (lines starting with
+ RISC-V (riscv64): `wordcraft-<ver>-linux-riscv64.tar.gz`, a tarball cross-compiled for glibc 2.39+
+ (Ubuntu 24.04, Debian 13 and newer).
+ 
+-**Wayland:** on a Wayland desktop the app runs through XWayland when it is available, because
+-winit (the windowing library) supports dragging files into the window only on X11. To use the
+-native Wayland backend instead (for example for sharper text with fractional scaling, at the cost
+-of file drag-and-drop), start it with `WORDCRAFT_WAYLAND=1`:
++**Wayland:** on a Wayland desktop the app uses the native Wayland backend, which is sharp at
++fractional scales and works with input methods. winit (the windowing library) supports dragging
++files into the window only on X11, so to drop files from the file manager, run the app through
++XWayland with `WORDCRAFT_X11=1` (this needs the X11 libraries: libX11, libX11-xcb, libXcursor
++and libXi):
+ 
+ ```sh
+-WORDCRAFT_WAYLAND=1 wordcraft
++WORDCRAFT_X11=1 wordcraft
+ ```
+ 
+ **Arch Linux (AUR).** Community members maintain three AUR packages; the project doesn't publish
+diff --git a/apps/wordcraft/src/main.rs b/apps/wordcraft/src/main.rs
+index f3778068de..bcf72f6a4c 100644
+--- a/apps/wordcraft/src/main.rs
++++ b/apps/wordcraft/src/main.rs
+@@ -272,7 +272,7 @@ fn x11_libraries_load() -> bool {
+     let missing = [Xlib::open().err(), Xcursor::open().err(), Xlib_xcb::open().err(), XInput2::open().err()];
+     let missing: Vec<String> = missing.into_iter().flatten().map(|e| e.to_string()).collect();
+     if !missing.is_empty() {
+-        log::warn!("X11 libraries missing, using the native Wayland backend: {}", missing.join("; "));
++        log::warn!("WORDCRAFT_X11: X11 libraries missing, using the native Wayland backend: {}", missing.join("; "));
+     }
+     missing.is_empty()
+ }
+@@ -412,11 +412,11 @@ fn main() -> eframe::Result {
+         options.viewport = window.apply(options.viewport);
+     }
+     #[cfg(all(unix, not(target_os = "macos")))]
+-    // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
+-    // manager showed a "no" cursor. Run through XWayland when it's there; WORDCRAFT_WAYLAND=1
+-    // keeps the native Wayland backend. The X11 libraries are only recommended by the packages,
+-    // so without them a Wayland desktop gets the native backend instead of a failed start.
+-    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_WAYLAND").is_none() && x11_libraries_load() {
++    // winit runs natively on a Wayland desktop: sharp at fractional scales, with working input
++    // methods. It has no file drag-and-drop there (only on X11), so WORDCRAFT_X11=1 runs through
++    // XWayland instead for dropping files from the file manager (#220). The X11 libraries are only
++    // recommended by the packages, so without them the setting is ignored rather than failing.
++    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_X11").is_some() && x11_libraries_load() {
+         options.event_loop_builder = Some(Box::new(|b| {
+             use winit::platform::x11::EventLoopBuilderExtX11;
+             b.with_x11();
+diff --git a/packaging/linux/nfpm.yaml b/packaging/linux/nfpm.yaml
+index 9eb1e51706..cd306b45b0 100644
+--- a/packaging/linux/nfpm.yaml
++++ b/packaging/linux/nfpm.yaml
+@@ -24,8 +24,8 @@ description: |-
+ 
+ # The binaries link only glibc and libgcc_s directly. Windowing (X11/Wayland, xkbcommon) and the
+ # GPU (Vulkan, EGL/GL) are loaded at runtime, so they are dependencies/recommendations here
+-# rather than ELF NEEDED entries. Without the X11 libraries the app runs on native Wayland
+-# (no file drag-and-drop there with winit 0.30), so they are recommendations.
++# rather than ELF NEEDED entries. On a Wayland desktop the app runs natively and needs X11 only
++# with WORDCRAFT_X11=1 (see main.rs), so the X11 libraries are recommendations.
+ overrides:
+   deb:
+     depends:
+
+From b22c8b9819b998638fce3f800a125b74168cc736 Mon Sep 17 00:00:00 2001
+From: bmh129 <11478682+bmh129@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:31:36 -0500
+Subject: [PATCH 3/7] ROADMAP: progress log for the native Wayland default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ROADMAP.md | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 5a9fbf09fe..cb9b4e9e66 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -2,7 +2,7 @@
+ 
+ **Stage: alpha** · next: beta, ~15 points (60% → 75% ready for real work) and ~150–230 h away
+ 
+-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-19 · **Change:** trivial (progress log: caret inside ligatures, #1974; previously trivial: text typed into a content control takes the control's formatting; localized placeholder styles recognised; previously trivial: forms protection keeps its content controls: no inserting, Properties or Remove Content Control; previously trivial: long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: a word after a slash wraps whole, like Word, #2963; previously trivial: progress log: a header-cell picture watermark sits behind the text, #1775; previously trivial: symbols keep their font when the text font changes, #2036; previously trivial: opening a DOCX no longer copies its pictures; previously trivial: Add Font imports every selected font file, #1789); previously trivial (RTF export writes sections (gap 19); previously trivial: ODT export writes sections (gap 19); previously trivial: Read Aloud speaks each sentence in its own language, #1843; previously trivial: hint-reliant CJK outlines; previously trivial: Ctrl+wheel zoom no longer scrolls the document, #1743; previously trivial: progress log: Turkish case mapping in AutoCorrect, #1923; previously trivial: a mouse drag on a table leaves the view where it is, #1738; previously trivial: progress log: Hebrew field results and smart quotes, #1670; previously trivial: Backspace removes a selected table, rows or columns, #1844; previously trivial: progress log: mixed Hebrew/Latin text keeps its order in Word, #1543; previously trivial: progress log: web typing in non-Latin text no longer repeats, #1480; previously trivial: progress log: font family caches bounded and math font lookups follow font changes, #1354; previously trivial: `-->` AutoCorrect replacement, #2223; previously trivial: numbered headings, #1793; previously trivial: Navigation Find exposes Results, #2096; previously trivial: progress log: Columns on selected text, #2024; previously trivial: progress log: legacy outline, shadow, emboss and imprint text effects drawn, #2534; previously trivial: progress log: Indonesian proofing, #498; previously trivial: progress log: DOCX glossary documents (building blocks); previously trivial: progress log: Read Mode keeps the keyboard and shows whole, unobscured columns, #1772); previously trivial: progress log: font list entries of tall-ascent fonts no longer cut off, #2570); previously trivial: progress log: Split Cells and Convert Text to Table dialogs follow the Word check, #2592; previously trivial: a new source's Tag is made like Word's, three letters of the author and two digits of the year with a number added when taken, and an edit keeps the Tag, #2094; previously trivial: Web Layout fills the window width, #1876; previously trivial: progress log: Different First Page headers reachable from page 1, #2826; previously trivial: Language dialog keeps inherited proofing language and no-proof choices (#2717); previously trivial: progress log: web preferences kept between visits, #2132; previously trivial: progress log: undrawable private-use list bullets show the level's default bullet, #1683; previously trivial: progress log: `w:eastAsianLayout` kept on save; previously trivial: table style editor formats every part, #714); previously trivial: VML freeforms read and kept on save; previously trivial: progress log: consistent preferred cell widths; previously trivial: multi-paragraph field instructions no longer add blank lines; previously trivial: page-break-only list paragraphs hide their labels; previously trivial: progress log: grouped `flowChartOr` shapes draw their circle and crossing spokes; previously trivial: progress log: copies keep their formatting in other programs, #1523; previously trivial: progress log: privacy options on save, #1062; previously trivial: progress log: equation pictures in theme colours on Windows, #1002; previously trivial: symbol fonts, #776; previously trivial: the save prompt answers from the keyboard, #861; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously trivial: formatting revisions landed, #41; previously trivial: Draw tab ink, #307, and Draw Table and Eraser, #303, landed: catalog 402/434; previously minor: readiness table with hours per audience; full number back to the additive weighted sum, 60%; mainstream and essentials numbers added; alpha gate checked; previously major: full re-measure against Word for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
++> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-20 · **Change:** trivial (progress log: native Wayland by default on Linux, WORDCRAFT_X11=1 for XWayland; X11 libraries optional; previously trivial: progress log: caret inside ligatures, #1974; previously trivial: text typed into a content control takes the control's formatting; localized placeholder styles recognised; previously trivial: forms protection keeps its content controls: no inserting, Properties or Remove Content Control; previously trivial: long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: a word after a slash wraps whole, like Word, #2963; previously trivial: progress log: a header-cell picture watermark sits behind the text, #1775; previously trivial: symbols keep their font when the text font changes, #2036; previously trivial: opening a DOCX no longer copies its pictures; previously trivial: Add Font imports every selected font file, #1789); previously trivial (RTF export writes sections (gap 19); previously trivial: ODT export writes sections (gap 19); previously trivial: Read Aloud speaks each sentence in its own language, #1843; previously trivial: hint-reliant CJK outlines; previously trivial: Ctrl+wheel zoom no longer scrolls the document, #1743; previously trivial: progress log: Turkish case mapping in AutoCorrect, #1923; previously trivial: a mouse drag on a table leaves the view where it is, #1738; previously trivial: progress log: Hebrew field results and smart quotes, #1670; previously trivial: Backspace removes a selected table, rows or columns, #1844; previously trivial: progress log: mixed Hebrew/Latin text keeps its order in Word, #1543; previously trivial: progress log: web typing in non-Latin text no longer repeats, #1480; previously trivial: progress log: font family caches bounded and math font lookups follow font changes, #1354; previously trivial: `-->` AutoCorrect replacement, #2223; previously trivial: numbered headings, #1793; previously trivial: Navigation Find exposes Results, #2096; previously trivial: progress log: Columns on selected text, #2024; previously trivial: progress log: legacy outline, shadow, emboss and imprint text effects drawn, #2534; previously trivial: progress log: Indonesian proofing, #498; previously trivial: progress log: DOCX glossary documents (building blocks); previously trivial: progress log: Read Mode keeps the keyboard and shows whole, unobscured columns, #1772); previously trivial: progress log: font list entries of tall-ascent fonts no longer cut off, #2570); previously trivial: progress log: Split Cells and Convert Text to Table dialogs follow the Word check, #2592; previously trivial: a new source's Tag is made like Word's, three letters of the author and two digits of the year with a number added when taken, and an edit keeps the Tag, #2094; previously trivial: Web Layout fills the window width, #1876; previously trivial: progress log: Different First Page headers reachable from page 1, #2826; previously trivial: Language dialog keeps inherited proofing language and no-proof choices (#2717); previously trivial: progress log: web preferences kept between visits, #2132; previously trivial: progress log: undrawable private-use list bullets show the level's default bullet, #1683; previously trivial: progress log: `w:eastAsianLayout` kept on save; previously trivial: table style editor formats every part, #714); previously trivial: VML freeforms read and kept on save; previously trivial: progress log: consistent preferred cell widths; previously trivial: multi-paragraph field instructions no longer add blank lines; previously trivial: page-break-only list paragraphs hide their labels; previously trivial: progress log: grouped `flowChartOr` shapes draw their circle and crossing spokes; previously trivial: progress log: copies keep their formatting in other programs, #1523; previously trivial: progress log: privacy options on save, #1062; previously trivial: progress log: equation pictures in theme colours on Windows, #1002; previously trivial: symbol fonts, #776; previously trivial: the save prompt answers from the keyboard, #861; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously trivial: formatting revisions landed, #41; previously trivial: Draw tab ink, #307, and Draw Table and Eraser, #303, landed: catalog 402/434; previously minor: readiness table with hours per audience; full number back to the additive weighted sum, 60%; mainstream and essentials numbers added; alpha gate checked; previously major: full re-measure against Word for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+ > **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-18 · **Change:** trivial (long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: a word after a slash wraps whole, like Word, #2963; previously trivial: RTF export writes sections (gap 19); previously trivial: ODT export writes sections (gap 19); previously trivial: progress log: pasted blockquotes are indented paragraphs, #1270; previously trivial: progress log: print-area strings translated in every catalog; previously trivial: progress log: comments readable in the dark theme, #2045; previously trivial: progress log: ODT sections, #1379; previously trivial: progress log: table deletes, Change Case and Unlink Fields respect Track Changes and locked content controls, #1329; previously trivial: progress log: rounded rectangle corners, #1476; previously trivial: progress log: Save As type list, #1399; previously trivial: progress log: privacy options on save, #1062; previously trivial: progress log: equation pictures in theme colours on Windows, #1002; previously trivial: symbol fonts, #776; previously trivial: the save prompt answers from the keyboard, #861; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously trivial: formatting revisions landed, #41; previously trivial: Draw tab ink, #307, and Draw Table and Eraser, #303, landed: catalog 402/434; previously minor: readiness table with hours per audience; full number back to the additive weighted sum, 60%; mainstream and essentials numbers added; alpha gate checked; previously major: full re-measure against Word for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+ > **Printing update:** 2026-10-12 · direct desktop printing through craft-print; details below.
+ 
+@@ -141,6 +141,7 @@ Imported Word 97–2003 `.doc`/`.dot` files now ask for a supported DOCX target
+ - 2026-10-15: Find opens Navigation on Results; editing the query restores Results after manual Headings/Pages navigation. Typed and selected-text searches retain document contents (#2096).
+ 
+ | Date | What landed |
++| 2026-10-20 | Linux: the app runs on the native Wayland backend on Wayland desktops (sharp at fractional scales, input methods work: #1382, #68, #2932, #2933, #1240); `WORDCRAFT_X11=1` runs through XWayland for file drag-and-drop, which winit 0.30 supports only on X11 (#220). Without the X11 libraries (only recommended by the packages) that setting is ignored instead of the app failing to start; the rpm also recommends `libX11-xcb`, which winit opens. |
+ | 2026-10-19 | Save As, Export and Open no longer do nothing on Linux desktops whose file chooser portal fails to show its dialog (#2999): a "cancel" quicker than anyone could make one asks again without the parent window, then opens the built-in file browser. |
+ | 2026-10-18 | Long navigation headings wrap onto further lines inside the resizable pane instead of ending in an ellipsis: the row grows with the text and the pane keeps its width (#759, #3015). |
+ | 2026-10-18 | Clearing a font query with no matches keeps Recently Used Fonts visible at the top of a scrollable list. The initial scroll position no longer skips its heading; measured keyboard scrolling is unchanged (#2068). |
+
+From 380778d3fe01ecfa632d99f11e3c0f32dbef99db Mon Sep 17 00:00:00 2001
+From: bmh129 <11478682+bmh129@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:52:27 -0500
+Subject: [PATCH 4/7] Linux: check libxkbcommon-x11 before X11; WORDCRAFT_X11
+ only when 1
+
+winit's X11 backend also loads libxkbcommon-x11 (for the keyboard) and
+panics when it is missing, so WORDCRAFT_X11=1 on a system without it
+failed to start instead of staying on native Wayland. The library check
+now includes it, through xkbcommon-dl's non-panicking loader (already in
+the build through winit), and the deb and rpm recommend it
+(libxkbcommon-x11-0, libxkbcommon-x11).
+
+WORDCRAFT_X11 turned XWayland on whenever it was set, so 0 or an empty
+value did too; only 1 does now, as documented.
+
+Both found in review by CodeRabbit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                 |  1 +
+ README.md                  |  4 ++--
+ apps/wordcraft/Cargo.toml  |  3 +++
+ apps/wordcraft/src/main.rs | 17 +++++++++++------
+ packaging/linux/nfpm.yaml  |  2 ++
+ 5 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 65b6cffb6d..b5614f95c7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5160,6 +5160,7 @@ dependencies = [
+  "wordcraft-proof",
+  "wordcraft-ui-egui",
+  "x11-dl",
++ "xkbcommon-dl",
+  "zbus",
+ ]
+ 
+diff --git a/README.md b/README.md
+index b2ebbc7543..4b3dde5f2e 100644
+--- a/README.md
++++ b/README.md
+@@ -281,8 +281,8 @@ RISC-V (riscv64): `wordcraft-<ver>-linux-riscv64.tar.gz`, a tarball cross-compil
+ **Wayland:** on a Wayland desktop the app uses the native Wayland backend, which is sharp at
+ fractional scales and works with input methods. winit (the windowing library) supports dragging
+ files into the window only on X11, so to drop files from the file manager, run the app through
+-XWayland with `WORDCRAFT_X11=1` (this needs the X11 libraries: libX11, libX11-xcb, libXcursor
+-and libXi):
++XWayland with `WORDCRAFT_X11=1` (this needs the X11 libraries: libX11, libX11-xcb, libXcursor,
++libXi and libxkbcommon-x11):
+ 
+ ```sh
+ WORDCRAFT_X11=1 wordcraft
+diff --git a/apps/wordcraft/Cargo.toml b/apps/wordcraft/Cargo.toml
+index f4fc5c3d97..4bf0a6d1f0 100644
+--- a/apps/wordcraft/Cargo.toml
++++ b/apps/wordcraft/Cargo.toml
+@@ -53,6 +53,9 @@ winit = { version = "0.30", default-features = false, features = ["x11"] }
+ # Checks that the X11 libraries are installed before choosing XWayland (see main.rs). Already in
+ # the build through winit, at this version.
+ x11-dl = "2.21"
++# Checks for libxkbcommon-x11 too, which winit's X11 backend needs for the keyboard and panics
++# without. Already in the build through winit, at this version and with this feature.
++xkbcommon-dl = { version = "0.4.2", features = ["x11"] }
+ # The desktop's animation setting on Linux and the BSDs, read from the XDG settings portal over
+ # D-Bus. Already in the build through AccessKit, at this version; this adds only its blocking API.
+ zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+diff --git a/apps/wordcraft/src/main.rs b/apps/wordcraft/src/main.rs
+index bcf72f6a4c..f903bfab26 100644
+--- a/apps/wordcraft/src/main.rs
++++ b/apps/wordcraft/src/main.rs
+@@ -264,13 +264,17 @@ fn app_icon() -> Option<egui::IconData> {
+ }
+ 
+ /// Whether the libraries winit's X11 backend opens at startup are installed (libX11, libXcursor,
+-/// libX11-xcb and libXi; libX11-xcb brings in libxcb). The deb and rpm only recommend them, and a
+-/// forced X11 backend without them fails to start.
++/// libX11-xcb and libXi; libX11-xcb brings in libxcb; and libxkbcommon-x11, for the keyboard).
++/// The deb and rpm only recommend them, and a forced X11 backend without them fails to start
++/// (winit panics when libxkbcommon-x11 is missing).
+ #[cfg(all(unix, not(target_os = "macos")))]
+ fn x11_libraries_load() -> bool {
+     use x11_dl::{xcursor::Xcursor, xinput2::XInput2, xlib::Xlib, xlib_xcb::Xlib_xcb};
+     let missing = [Xlib::open().err(), Xcursor::open().err(), Xlib_xcb::open().err(), XInput2::open().err()];
+-    let missing: Vec<String> = missing.into_iter().flatten().map(|e| e.to_string()).collect();
++    let mut missing: Vec<String> = missing.into_iter().flatten().map(|e| e.to_string()).collect();
++    if xkbcommon_dl::x11::xkbcommon_x11_option().is_none() {
++        missing.push("libxkbcommon-x11.so.0 could not be loaded".into());
++    }
+     if !missing.is_empty() {
+         log::warn!("WORDCRAFT_X11: X11 libraries missing, using the native Wayland backend: {}", missing.join("; "));
+     }
+@@ -414,9 +418,10 @@ fn main() -> eframe::Result {
+     #[cfg(all(unix, not(target_os = "macos")))]
+     // winit runs natively on a Wayland desktop: sharp at fractional scales, with working input
+     // methods. It has no file drag-and-drop there (only on X11), so WORDCRAFT_X11=1 runs through
+-    // XWayland instead for dropping files from the file manager (#220). The X11 libraries are only
+-    // recommended by the packages, so without them the setting is ignored rather than failing.
+-    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_X11").is_some() && x11_libraries_load() {
++    // XWayland instead for dropping files from the file manager (#220); any other value, 0 or
++    // empty included, leaves it off. The X11 libraries are only recommended by the packages, so
++    // without them the setting is ignored rather than failing.
++    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_X11").is_some_and(|v| v == "1") && x11_libraries_load() {
+         options.event_loop_builder = Some(Box::new(|b| {
+             use winit::platform::x11::EventLoopBuilderExtX11;
+             b.with_x11();
+diff --git a/packaging/linux/nfpm.yaml b/packaging/linux/nfpm.yaml
+index cd306b45b0..242d3e5e7c 100644
+--- a/packaging/linux/nfpm.yaml
++++ b/packaging/linux/nfpm.yaml
+@@ -37,6 +37,7 @@ overrides:
+       - libwayland-client0
+       - libx11-6
+       - libx11-xcb1
++      - libxkbcommon-x11-0
+       - libxcursor1
+       - libxi6
+       - libxrandr2
+@@ -50,6 +51,7 @@ overrides:
+       - libwayland-client
+       - libX11
+       - libX11-xcb
++      - libxkbcommon-x11
+       - libXcursor
+       - libXi
+       - libXrandr
+
+From 16e2472caf83083b9664c0cd90c2ddd1a2692f89 Mon Sep 17 00:00:00 2001
+From: bmh129 <11478682+bmh129@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:24:52 -0500
+Subject: [PATCH 5/7] Linux: GNOME-style window buttons in the title bar on
+ Wayland (#78)
+
+GNOME's Wayland compositor draws no window frames (it offers no
+zxdg_decoration_manager_v1), so with the native Wayland backend winit drew
+its own fallback frame above WordCraft's title bar, ignoring GNOME's theme,
+dark mode and button layout. WordCraft now asks the compositor at launch
+(apps/wordcraft/src/decorations.rs) and, where it draws no frames, turns
+winit's frame off and makes the title bar the header bar, as in GNOME's own
+apps (crates/ui-egui/src/window_controls.rs), as GridCraft and PdfCraft do:
+
+- Minimize, maximize/restore and close in Adwaita's style (round buttons,
+  symbolic glyphs drawn in code, no new assets), in the order and on the
+  side named by org.gnome.desktop.wm.preferences button-layout, read
+  through the XDG Desktop Portal with a 2 s timeout. Hidden in full screen.
+  File (the Backstage) covers the title bar, so it gets a bar of its own
+  carrying the buttons and dragging the window.
+- Resize zones along the window's edges and L-shaped corners, above the
+  rest of the UI; a hairline outlines the window while it isn't maximized.
+- File > Options > General > Use system title bar (shown only where the
+  app draws the buttons) gives the window back winit's frame at once,
+  without a restart; read before the window opens, so it opens with the
+  right frame. `ui.systemTitleBar`; saved as `systemTitleBar`.
+- WORDCRAFT_TITLEBAR=app|system overrides the detection.
+
+KDE, Sway, Hyprland, COSMIC, X11 and WORDCRAFT_X11=1 keep the frame their
+desktop draws; macOS and Windows are unchanged. The new labels are in all
+22 catalogs.
+
+Not done: right-clicking the title bar doesn't open GNOME's window menu,
+the window has no shadow or rounded corners, and the resize zones lie just
+inside the window rather than outside it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                            |   1 +
+ README.md                             |   5 +
+ apps/wordcraft/Cargo.toml             |   3 +
+ apps/wordcraft/src/decorations.rs     |  62 +++++
+ apps/wordcraft/src/main.rs            |  26 +-
+ crates/ui-egui/src/chrome.rs          |  18 +-
+ crates/ui-egui/src/i18n/bg.tsv        |   6 +
+ crates/ui-egui/src/i18n/cs.tsv        |   6 +
+ crates/ui-egui/src/i18n/de.tsv        |   6 +
+ crates/ui-egui/src/i18n/es.tsv        |   6 +
+ crates/ui-egui/src/i18n/et.tsv        |   6 +
+ crates/ui-egui/src/i18n/fr.tsv        |   6 +
+ crates/ui-egui/src/i18n/hr.tsv        |   6 +
+ crates/ui-egui/src/i18n/hu.tsv        |   6 +
+ crates/ui-egui/src/i18n/it.tsv        |   6 +
+ crates/ui-egui/src/i18n/ja.tsv        |   6 +
+ crates/ui-egui/src/i18n/ko.tsv        |   6 +
+ crates/ui-egui/src/i18n/pl.tsv        |   6 +
+ crates/ui-egui/src/i18n/pt-br.tsv     |   6 +
+ crates/ui-egui/src/i18n/ru.tsv        |   6 +
+ crates/ui-egui/src/i18n/sr-latn.tsv   |   6 +
+ crates/ui-egui/src/i18n/sr.tsv        |   6 +
+ crates/ui-egui/src/i18n/sv.tsv        |   6 +
+ crates/ui-egui/src/i18n/tr.tsv        |   6 +
+ crates/ui-egui/src/i18n/uk.tsv        |   6 +
+ crates/ui-egui/src/i18n/vi.tsv        |   6 +
+ crates/ui-egui/src/i18n/zh-hans.tsv   |   6 +
+ crates/ui-egui/src/i18n/zh-hant.tsv   |   6 +
+ crates/ui-egui/src/lib.rs             | 154 +++++++++++
+ crates/ui-egui/src/options.rs         |  11 +
+ crates/ui-egui/src/window_controls.rs | 360 ++++++++++++++++++++++++++
+ docs/control-protocol.md              |   2 +-
+ docs/ui-parity.md                     |   5 +-
+ 33 files changed, 773 insertions(+), 6 deletions(-)
+ create mode 100644 apps/wordcraft/src/decorations.rs
+ create mode 100644 crates/ui-egui/src/window_controls.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index b5614f95c7..aca026ec50 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5149,6 +5149,7 @@ dependencies = [
+  "pollster 0.4.0",
+  "rfd",
+  "serde_json",
++ "wayland-client",
+  "windows",
+  "winit",
+  "winresource",
+diff --git a/README.md b/README.md
+index 4b3dde5f2e..e2c162c986 100644
+--- a/README.md
++++ b/README.md
+@@ -288,6 +288,11 @@ libXi and libxkbcommon-x11):
+ WORDCRAFT_X11=1 wordcraft
+ ```
+ 
++Where the compositor draws no window frames (GNOME), the title bar carries GNOME-style minimize,
++maximize and close buttons in the order GNOME's button layout setting names, and the window's
++edges resize it. File › Options › General › Use system title bar gives the window a basic frame
++instead; `WORDCRAFT_TITLEBAR=app` or `=system` overrides the detection.
++
+ **Arch Linux (AUR).** Community members maintain three AUR packages; the project doesn't publish
+ to the AUR itself. Install one of them:
+ | Package | What it installs | Choose it when |
+diff --git a/apps/wordcraft/Cargo.toml b/apps/wordcraft/Cargo.toml
+index 4bf0a6d1f0..9acde9d805 100644
+--- a/apps/wordcraft/Cargo.toml
++++ b/apps/wordcraft/Cargo.toml
+@@ -63,6 +63,9 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
+ # types that arboard doesn't read, and the formats offered. Already in the build through arboard's
+ # `wayland-data-control` feature, at this version.
+ wl-clipboard-rs = "0.9"
++# Asks the Wayland compositor whether it draws window frames (`decorations.rs`). Already in the
++# build through winit, at this version.
++wayland-client = "0.31"
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+ # The upstream default-apps button opens Windows Settings; printing uses craft-print instead.
+diff --git a/apps/wordcraft/src/decorations.rs b/apps/wordcraft/src/decorations.rs
+new file mode 100644
+index 0000000000..079e7f7953
+--- /dev/null
++++ b/apps/wordcraft/src/decorations.rs
+@@ -0,0 +1,62 @@
++//! Who draws the window frame on Linux and the BSDs.
++//!
++//! Wayland compositors that draw frames for their clients offer `zxdg_decoration_manager_v1`
++//! (KDE, Sway, Hyprland, COSMIC). GNOME doesn't: it leaves the frame to the app, and winit then
++//! drew an imitation of GNOME's above WordCraft's title bar. Without that protocol WordCraft
++//! turns winit's frame off and its title bar becomes the header bar, as in GNOME's own apps
++//! (`wordcraft_ui_egui::window_controls`), with the window buttons GNOME's `button-layout` names.
++//! X11 window managers always draw the frame.
++//!
++//! `WORDCRAFT_TITLEBAR=app` or `=system` overrides the choice.
++
++use wordcraft_ui_egui::window_controls::Layout;
++
++/// The window buttons to draw in the app, or `None` when the desktop draws the frame. `x11`: the
++/// app runs through X11 (XWayland included, `WORDCRAFT_X11`), whose window manager draws it.
++pub(crate) fn app_drawn(x11: bool) -> Option<Layout> {
++    if cfg!(any(target_os = "macos", target_os = "windows")) || x11 {
++        return None;
++    }
++    let drawn = match std::env::var("WORDCRAFT_TITLEBAR").ok().as_deref().map(str::trim) {
++        Some("app") => true,
++        Some("system") => false,
++        _ => compositor_leaves_frame_to_app(),
++    };
++    drawn.then(Layout::desktop)
++}
++
++/// Whether this is a Wayland session whose compositor draws no frames.
++#[cfg(all(unix, not(target_os = "macos")))]
++fn compositor_leaves_frame_to_app() -> bool {
++    use wayland_client::Connection;
++    use wayland_client::globals::registry_queue_init;
++    // No Wayland compositor: X11, whose window manager draws the frame (winit falls back to it).
++    let Ok(conn) = Connection::connect_to_env() else { return false };
++    let Ok((globals, _queue)) = registry_queue_init::<Registry>(&conn) else { return false };
++    let offered = globals.contents().with_list(|list| list.iter().any(|g| g.interface == "zxdg_decoration_manager_v1"));
++    if !offered {
++        log::info!("the Wayland compositor draws no window frames; WordCraft draws its own window buttons");
++    }
++    !offered
++}
++
++#[cfg(not(all(unix, not(target_os = "macos"))))]
++fn compositor_leaves_frame_to_app() -> bool {
++    false
++}
++
++#[cfg(all(unix, not(target_os = "macos")))]
++struct Registry;
++
++#[cfg(all(unix, not(target_os = "macos")))]
++impl wayland_client::Dispatch<wayland_client::protocol::wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for Registry {
++    fn event(
++        _: &mut Self,
++        _: &wayland_client::protocol::wl_registry::WlRegistry,
++        _: wayland_client::protocol::wl_registry::Event,
++        _: &wayland_client::globals::GlobalListContents,
++        _: &wayland_client::Connection,
++        _: &wayland_client::QueueHandle<Self>,
++    ) {
++    }
++}
+diff --git a/apps/wordcraft/src/main.rs b/apps/wordcraft/src/main.rs
+index f903bfab26..adb8b47556 100644
+--- a/apps/wordcraft/src/main.rs
++++ b/apps/wordcraft/src/main.rs
+@@ -14,6 +14,7 @@ mod animations;
+ mod apple_events;
+ mod clipboard;
+ mod control_server;
++mod decorations;
+ mod default_apps;
+ mod file_dialogs;
+ #[cfg(any(target_os = "windows", target_os = "macos", test))]
+@@ -165,6 +166,13 @@ fn prefs_enabled() -> bool {
+     std::env::var_os("WORDCRAFT_NO_PREFS").is_none()
+ }
+ 
++/// File › Options › Use system title bar as last saved, before the window (and the app that loads
++/// the preferences) exists.
++fn saved_system_title_bar() -> bool {
++    prefs_enabled()
++        && prefs_path().and_then(|p| std::fs::read(p).ok()).and_then(|bytes| UiState::from_json(&bytes)).is_some_and(|ui| ui.system_title_bar)
++}
++
+ fn load_prefs(app: &mut WordApp) {
+     if !prefs_enabled() {
+         return;
+@@ -415,18 +423,30 @@ fn main() -> eframe::Result {
+     if let Some(window) = restored {
+         options.viewport = window.apply(options.viewport);
+     }
+-    #[cfg(all(unix, not(target_os = "macos")))]
+     // winit runs natively on a Wayland desktop: sharp at fractional scales, with working input
+     // methods. It has no file drag-and-drop there (only on X11), so WORDCRAFT_X11=1 runs through
+     // XWayland instead for dropping files from the file manager (#220); any other value, 0 or
+     // empty included, leaves it off. The X11 libraries are only recommended by the packages, so
+     // without them the setting is ignored rather than failing.
+-    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_X11").is_some_and(|v| v == "1") && x11_libraries_load() {
++    #[cfg(all(unix, not(target_os = "macos")))]
++    let x11 = std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_X11").is_some_and(|v| v == "1") && x11_libraries_load();
++    #[cfg(not(all(unix, not(target_os = "macos"))))]
++    let x11 = false;
++    #[cfg(all(unix, not(target_os = "macos")))]
++    if x11 {
+         options.event_loop_builder = Some(Box::new(|b| {
+             use winit::platform::x11::EventLoopBuilderExtX11;
+             b.with_x11();
+         }));
+     }
++    // GNOME on Wayland leaves the window frame to the app (decorations.rs): the title bar carries
++    // the window buttons instead, unless File › Options › Use system title bar is on. Read before
++    // the window opens, so it opens with the right frame.
++    let window_controls = decorations::app_drawn(x11);
++    let app_frame = window_controls.is_some() && !saved_system_title_bar();
++    if app_frame {
++        options.viewport = options.viewport.with_decorations(false);
++    }
+     // Registered before the event loop starts, so it catches the Finder event that launched us as
+     // well as later ones. Lives until the event loop returns; the app creator only borrows it.
+     #[cfg(target_os = "macos")]
+@@ -464,6 +484,8 @@ fn main() -> eframe::Result {
+             }
+             app.ui.window = restored;
+             app.integrated_titlebar = cfg!(target_os = "macos");
++            app.app_frame_shown = window_controls.as_ref().map(|_| app_frame);
++            app.window_controls = window_controls;
+             #[cfg(target_os = "macos")]
+             if let Some(bar) = traffic_lights::title_bar() {
+                 log::info!("title bar: {bar:?}");
+diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
+index b5b63d1414..1a93a97a06 100644
+--- a/crates/ui-egui/src/chrome.rs
++++ b/crates/ui-egui/src/chrome.rs
+@@ -5,7 +5,7 @@ use serde_json::json;
+ use wordcraft_doc::StoryRef;
+ 
+ use crate::theme::{Tokens, TypeRung, medium, paint_text, regular, semibold, text_width};
+-use crate::{WordApp, icons};
++use crate::{WordApp, icons, window_controls};
+ 
+ /// The Quick Access Toolbar's button for command `id`.
+ pub(crate) fn qat_button_id(id: &str) -> egui::Id {
+@@ -277,8 +277,15 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
+             }
+             let mut qat_end = full.min.x;
+             let mut right_start = full.max.x;
++            // GNOME on Wayland: the title bar is the header bar, with the window buttons at its
++            // ends (`window_controls`), in the desktop's order; hidden in full screen.
++            let controls = app.shown_window_controls(ui.ctx()).unwrap_or_else(window_controls::Layout::none);
+             ui.horizontal_centered(|ui| {
+                 ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
++                if !controls.left.is_empty() {
++                    ui.scope(|ui| window_controls::buttons(ui, &controls.left));
++                    ui.add_space(window_controls::SIDE_GAP);
++                }
+                 // AutoSave switch: greyed out, with the reason as its tooltip, when AutoSave can't
+                 // cover the document (#196, #176); clicking it then offers Save As where that helps.
+                 let block = app.autosave_block();
+@@ -316,6 +323,15 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
+                 }
+                 qat_end = ui.min_rect().max.x;
+                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                    if !controls.right.is_empty() {
++                        // Laid out left to right inside the right-to-left run, so they read in the
++                        // desktop's order.
++                        let size = vec2(window_controls::width(&controls.right), window_controls::BUTTON);
++                        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
++                            window_controls::buttons(ui, &controls.right);
++                        });
++                        ui.add_space(window_controls::SIDE_GAP);
++                    }
+                     // Account / community.
+                     let (r, resp) = ui.allocate_exact_size(vec2(control_h, control_h), Sense::click());
+                     ui.painter().circle_filled(r.center(), control_h / 2.0 - 1.0, t.accent);
+diff --git a/crates/ui-egui/src/i18n/bg.tsv b/crates/ui-egui/src/i18n/bg.tsv
+index 1994f2a154..95034c8bc1 100644
+--- a/crates/ui-egui/src/i18n/bg.tsv
++++ b/crates/ui-egui/src/i18n/bg.tsv
+@@ -2688,3 +2688,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Въведете размер в произволна единица, например 5 cm или 300 px. Другата страна се променя съответно, така че картината запазва пропорциите си.
+ 
+ 	Import…	Импортиране…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Минимизиране
++	Maximize	Максимизиране
++	Restore	Възстановяване
++	Use system title bar	Използване на системната заглавна лента
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Показва обикновена заглавна лента с бутоните на прозореца над тази на WordCraft. GNOME не рисува заглавни ленти за приложенията, затова тази не следва темата му.
+diff --git a/crates/ui-egui/src/i18n/cs.tsv b/crates/ui-egui/src/i18n/cs.tsv
+index a7c5060735..8239d0d8ec 100644
+--- a/crates/ui-egui/src/i18n/cs.tsv
++++ b/crates/ui-egui/src/i18n/cs.tsv
+@@ -2691,3 +2691,9 @@ preview	Title	Ukázka
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Zadejte velikost v libovolné jednotce, například 5 cm nebo 300 px. Druhá strana se přizpůsobí, takže obrázek zachová své proporce.
+ 
+ 	Import…	Importovat…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Minimalizovat
++	Maximize	Maximalizovat
++	Restore	Obnovit
++	Use system title bar	Použít systémové záhlaví okna
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Zobrazí nad záhlavím WordCraftu jednoduché záhlaví s tlačítky okna. GNOME aplikacím záhlaví nekreslí, takže toto nesleduje jeho motiv.
+diff --git a/crates/ui-egui/src/i18n/de.tsv b/crates/ui-egui/src/i18n/de.tsv
+index eeb70c65e8..a4900ac0da 100644
+--- a/crates/ui-egui/src/i18n/de.tsv
++++ b/crates/ui-egui/src/i18n/de.tsv
+@@ -2287,3 +2287,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Geben Sie eine Größe in einer beliebigen Einheit ein, z. B. 5 cm oder 300 px. Die andere Seite passt sich an, sodass das Bild seine Proportionen behält.
+ 
+ 	Import…	Importieren…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Minimieren
++	Maximize	Maximieren
++	Restore	Wiederherstellen
++	Use system title bar	System-Titelleiste verwenden
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Eine einfache Titelleiste für die Fensterknöpfe über der von WordCraft anzeigen. GNOME zeichnet für Apps keine Titelleisten, daher folgt diese nicht seinem Design.
+diff --git a/crates/ui-egui/src/i18n/es.tsv b/crates/ui-egui/src/i18n/es.tsv
+index 19ef8fcf53..85cea4a3e4 100644
+--- a/crates/ui-egui/src/i18n/es.tsv
++++ b/crates/ui-egui/src/i18n/es.tsv
+@@ -2654,3 +2654,9 @@ preview	Title	Título
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Escribe un tamaño en cualquier unidad, como 5 cm o 300 px. El otro lado se ajusta, así que la imagen conserva sus proporciones.
+ 
+ 	Import…	Importar…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Minimizar
++	Maximize	Maximizar
++	Restore	Restaurar
++	Use system title bar	Usar la barra de título del sistema
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Muestra una barra de título básica con los botones de la ventana encima de la de WordCraft. GNOME no dibuja barras de título para las aplicaciones, así que esta no sigue su tema.
+diff --git a/crates/ui-egui/src/i18n/et.tsv b/crates/ui-egui/src/i18n/et.tsv
+index 0aa9e52c17..69312d8e2c 100644
+--- a/crates/ui-egui/src/i18n/et.tsv
++++ b/crates/ui-egui/src/i18n/et.tsv
+@@ -2322,3 +2322,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Sisesta suurus mis tahes ühikus, näiteks 5 cm või 300 px. Teine külg muutub kaasa, nii et pilt säilitab oma proportsioonid.
+ 
+ 	Import…	Impordi…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Minimeeri
++	Maximize	Maksimeeri
++	Restore	Taasta
++	Use system title bar	Kasuta süsteemi tiitliriba
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Näitab WordCrafti enda tiitliriba kohal lihtsat tiitliriba akna nuppudega. GNOME ei joonista rakendustele tiitliribasid, seega see ei järgi tema teemat.
+diff --git a/crates/ui-egui/src/i18n/fr.tsv b/crates/ui-egui/src/i18n/fr.tsv
+index 44c9cb9377..5eb944f738 100644
+--- a/crates/ui-egui/src/i18n/fr.tsv
++++ b/crates/ui-egui/src/i18n/fr.tsv
+@@ -2700,3 +2700,9 @@ template	Letter	Lettre
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Tapez une taille dans n'importe quelle unité, par exemple 5 cm ou 300 px. L'autre côté suit, et l'image garde ses proportions.
+ 
+ 	Import…	Importer…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Réduire
++	Maximize	Agrandir
++	Restore	Restaurer
++	Use system title bar	Utiliser la barre de titre du système
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Affiche une barre de titre simple avec les boutons de la fenêtre au-dessus de celle de WordCraft. GNOME ne dessine pas de barre de titre pour les applications, celle-ci ne suit donc pas son thème.
+diff --git a/crates/ui-egui/src/i18n/hr.tsv b/crates/ui-egui/src/i18n/hr.tsv
+index 15bbbb54d4..035c39191f 100644
+--- a/crates/ui-egui/src/i18n/hr.tsv
++++ b/crates/ui-egui/src/i18n/hr.tsv
+@@ -2699,3 +2699,9 @@ preview	Title	Naslov
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Upišite veličinu u bilo kojoj jedinici, npr. 5 cm ili 300 px. Druga se strana prilagođava pa slika zadržava svoje proporcije.
+ 
+ 	Import…	Uvezi…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Smanji
++	Maximize	Povećaj
++	Restore	Vrati
++	Use system title bar	Koristi naslovnu traku sustava
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Prikazuje jednostavnu naslovnu traku s gumbima prozora iznad WordCraftove. GNOME aplikacijama ne crta naslovne trake, pa ova ne prati njegovu temu.
+diff --git a/crates/ui-egui/src/i18n/hu.tsv b/crates/ui-egui/src/i18n/hu.tsv
+index 33951fee5f..d4ee470c34 100644
+--- a/crates/ui-egui/src/i18n/hu.tsv
++++ b/crates/ui-egui/src/i18n/hu.tsv
+@@ -2695,3 +2695,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Írj be egy méretet bármilyen mértékegységben, például 5 cm vagy 300 px. A másik oldal követi, így a kép megtartja az arányait.
+ 
+ 	Import…	Importálás…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Kis méret
++	Maximize	Teljes méret
++	Restore	Előző méret
++	Use system title bar	A rendszer címsorának használata
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Egyszerű címsort jelenít meg az ablak gombjaival a WordCraft saját címsora fölött. A GNOME nem rajzol címsort az alkalmazásoknak, ezért ez nem követi a témáját.
+diff --git a/crates/ui-egui/src/i18n/it.tsv b/crates/ui-egui/src/i18n/it.tsv
+index 3dd2b6d61d..eb1ed6b5a8 100644
+--- a/crates/ui-egui/src/i18n/it.tsv
++++ b/crates/ui-egui/src/i18n/it.tsv
+@@ -2708,3 +2708,9 @@ preview	Title	Esempio
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Scrivi una dimensione in qualsiasi unità, ad esempio 5 cm o 300 px. L'altro lato si adegua, così l'immagine mantiene le proporzioni.
+ 
+ 	Import…	Importa…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Riduci a icona
++	Maximize	Ingrandisci
++	Restore	Ripristina
++	Use system title bar	Usa la barra del titolo di sistema
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Mostra una semplice barra del titolo con i pulsanti della finestra sopra quella di WordCraft. GNOME non disegna barre del titolo per le app, quindi questa non segue il suo tema.
+diff --git a/crates/ui-egui/src/i18n/ja.tsv b/crates/ui-egui/src/i18n/ja.tsv
+index d633eac511..f391c40baa 100644
+--- a/crates/ui-egui/src/i18n/ja.tsv
++++ b/crates/ui-egui/src/i18n/ja.tsv
+@@ -2288,3 +2288,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	5 cm や 300 px など、任意の単位でサイズを入力します。もう一方の辺も合わせて変わるため、図の縦横比は保たれます。
+ 
+ 	Import…	インポート…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	最小化
++	Maximize	最大化
++	Restore	元のサイズに戻す
++	Use system title bar	システムのタイトル バーを使う
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	WordCraft のタイトル バーの上に、ウィンドウ ボタン付きの基本的なタイトル バーを表示します。GNOME はアプリのタイトル バーを描画しないため、このバーはテーマに従いません。
+diff --git a/crates/ui-egui/src/i18n/ko.tsv b/crates/ui-egui/src/i18n/ko.tsv
+index 7e50812e09..fc87b057f6 100644
+--- a/crates/ui-egui/src/i18n/ko.tsv
++++ b/crates/ui-egui/src/i18n/ko.tsv
+@@ -2542,3 +2542,9 @@ preview	Title	제목
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	5 cm 또는 300 px처럼 원하는 단위로 크기를 입력하세요. 다른 쪽도 함께 바뀌어 그림의 비율이 유지됩니다.
+ 
+ 	Import…	가져오기…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	최소화
++	Maximize	최대화
++	Restore	이전 크기로
++	Use system title bar	시스템 제목 표시줄 사용
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	WordCraft의 제목 표시줄 위에 창 단추가 있는 기본 제목 표시줄을 표시합니다. GNOME은 앱의 제목 표시줄을 그리지 않으므로 이 표시줄은 테마를 따르지 않습니다.
+diff --git a/crates/ui-egui/src/i18n/pl.tsv b/crates/ui-egui/src/i18n/pl.tsv
+index ccbeb471fe..aa3c5f3bc2 100644
+--- a/crates/ui-egui/src/i18n/pl.tsv
++++ b/crates/ui-egui/src/i18n/pl.tsv
+@@ -2704,3 +2704,9 @@ preview	Title	Tytuł
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Wpisz rozmiar w dowolnej jednostce, np. 5 cm lub 300 px. Druga strona dopasuje się, więc obraz zachowa proporcje.
+ 
+ 	Import…	Importuj…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Minimalizuj
++	Maximize	Maksymalizuj
++	Restore	Przywróć
++	Use system title bar	Użyj systemowego paska tytułu
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Pokazuje prosty pasek tytułu z przyciskami okna nad paskiem WordCrafta. GNOME nie rysuje pasków tytułu dla aplikacji, więc ten nie stosuje się do jego motywu.
+diff --git a/crates/ui-egui/src/i18n/pt-br.tsv b/crates/ui-egui/src/i18n/pt-br.tsv
+index 1a1038e1a7..4d9b2bacb3 100644
+--- a/crates/ui-egui/src/i18n/pt-br.tsv
++++ b/crates/ui-egui/src/i18n/pt-br.tsv
+@@ -2300,3 +2300,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Digite um tamanho em qualquer unidade, como 5 cm ou 300 px. O outro lado acompanha, e a imagem mantém as proporções.
+ 
+ 	Import…	Importar…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Minimizar
++	Maximize	Maximizar
++	Restore	Restaurar
++	Use system title bar	Usar a barra de título do sistema
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Mostra uma barra de título simples com os botões da janela acima da do WordCraft. O GNOME não desenha barras de título para os aplicativos, então esta não segue o tema dele.
+diff --git a/crates/ui-egui/src/i18n/ru.tsv b/crates/ui-egui/src/i18n/ru.tsv
+index cd064b4eeb..151f35beda 100644
+--- a/crates/ui-egui/src/i18n/ru.tsv
++++ b/crates/ui-egui/src/i18n/ru.tsv
+@@ -2697,3 +2697,9 @@ preview	Title	Пример
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Введите размер в любых единицах, например 5 cm или 300 px. Другая сторона изменится вместе с ней, и рисунок сохранит пропорции.
+ 
+ 	Import…	Импорт…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Свернуть
++	Maximize	Развернуть
++	Restore	Восстановить
++	Use system title bar	Использовать системный заголовок окна
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Показывает простой заголовок окна с кнопками над заголовком WordCraft. GNOME не рисует заголовки для приложений, поэтому этот не следует его теме.
+diff --git a/crates/ui-egui/src/i18n/sr-latn.tsv b/crates/ui-egui/src/i18n/sr-latn.tsv
+index 8e0a9136c2..0c0b13675d 100644
+--- a/crates/ui-egui/src/i18n/sr-latn.tsv
++++ b/crates/ui-egui/src/i18n/sr-latn.tsv
+@@ -2298,3 +2298,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Unesite veličinu u bilo kojoj jedinici, na primer 5 cm ili 300 px. Druga strana se prilagođava, pa slika zadržava svoje proporcije.
+ 
+ 	Import…	Uvezi…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Umanji
++	Maximize	Uvećaj
++	Restore	Vrati
++	Use system title bar	Koristi sistemsku traku naslova
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Prikazuje jednostavnu traku naslova sa dugmadima prozora iznad WordCraft-ove. GNOME ne crta trake naslova za aplikacije, pa ova ne prati njegovu temu.
+diff --git a/crates/ui-egui/src/i18n/sr.tsv b/crates/ui-egui/src/i18n/sr.tsv
+index c55fa2c7e4..8b0f5292c7 100644
+--- a/crates/ui-egui/src/i18n/sr.tsv
++++ b/crates/ui-egui/src/i18n/sr.tsv
+@@ -2302,3 +2302,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Унесите величину у било којој јединици, на пример 5 cm или 300 px. Друга страна се прилагођава, па слика задржава своје пропорције.
+ 
+ 	Import…	Увези…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Умањи
++	Maximize	Увећај
++	Restore	Врати
++	Use system title bar	Користи системску траку наслова
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Приказује једноставну траку наслова са дугмадима прозора изнад WordCraft-ове. GNOME не црта траке наслова за апликације, па ова не прати његову тему.
+diff --git a/crates/ui-egui/src/i18n/sv.tsv b/crates/ui-egui/src/i18n/sv.tsv
+index 2098fc2784..adab8cc4c3 100644
+--- a/crates/ui-egui/src/i18n/sv.tsv
++++ b/crates/ui-egui/src/i18n/sv.tsv
+@@ -2714,3 +2714,9 @@ preview	Title	Titel
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Skriv en storlek i valfri enhet, till exempel 5 cm eller 300 px. Den andra sidan följer med, så att bilden behåller sina proportioner.
+ 
+ 	Import…	Importera…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Minimera
++	Maximize	Maximera
++	Restore	Återställ
++	Use system title bar	Använd systemets namnlist
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Visar en enkel namnlist med fönsterknapparna ovanför WordCrafts egen. GNOME ritar inga namnlister åt appar, så den här följer inte dess tema.
+diff --git a/crates/ui-egui/src/i18n/tr.tsv b/crates/ui-egui/src/i18n/tr.tsv
+index 50799c62de..f619bb0fcb 100644
+--- a/crates/ui-egui/src/i18n/tr.tsv
++++ b/crates/ui-egui/src/i18n/tr.tsv
+@@ -2696,3 +2696,9 @@ preview	Title	Örnek
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Herhangi bir birimde bir boyut yazın, örneğin 5 cm veya 300 px. Diğer kenar da buna uyar, böylece resim oranlarını korur.
+ 
+ 	Import…	İçe aktar…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Simge durumuna küçült
++	Maximize	Ekranı kapla
++	Restore	Geri yükle
++	Use system title bar	Sistem başlık çubuğunu kullan
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	WordCraft'ın başlık çubuğunun üstünde pencere düğmelerini içeren basit bir başlık çubuğu gösterir. GNOME uygulamalar için başlık çubuğu çizmediğinden bu çubuk onun temasına uymaz.
+diff --git a/crates/ui-egui/src/i18n/uk.tsv b/crates/ui-egui/src/i18n/uk.tsv
+index f327585957..27aebcb4ad 100644
+--- a/crates/ui-egui/src/i18n/uk.tsv
++++ b/crates/ui-egui/src/i18n/uk.tsv
+@@ -2300,3 +2300,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Введіть розмір у будь-яких одиницях, наприклад 5 cm або 300 px. Інша сторона зміниться разом із нею, тож зображення збереже пропорції.
+ 
+ 	Import…	Імпортувати…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Згорнути
++	Maximize	Розгорнути
++	Restore	Відновити
++	Use system title bar	Використовувати системний заголовок вікна
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Показує простий заголовок вікна з кнопками над заголовком WordCraft. GNOME не малює заголовки для застосунків, тому цей не відповідає його темі.
+diff --git a/crates/ui-egui/src/i18n/vi.tsv b/crates/ui-egui/src/i18n/vi.tsv
+index e2bfe75ec2..14ac8d4942 100644
+--- a/crates/ui-egui/src/i18n/vi.tsv
++++ b/crates/ui-egui/src/i18n/vi.tsv
+@@ -2739,3 +2739,9 @@ template	Letter	Thư
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	Nhập kích thước theo đơn vị bất kỳ, ví dụ 5 cm hoặc 300 px. Cạnh còn lại thay đổi theo, nên ảnh giữ nguyên tỷ lệ.
+ 
+ 	Import…	Nhập…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	Thu nhỏ
++	Maximize	Phóng to
++	Restore	Khôi phục
++	Use system title bar	Dùng thanh tiêu đề của hệ thống
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	Hiện một thanh tiêu đề đơn giản có các nút cửa sổ phía trên thanh tiêu đề của WordCraft. GNOME không vẽ thanh tiêu đề cho ứng dụng, nên thanh này không theo chủ đề của nó.
+diff --git a/crates/ui-egui/src/i18n/zh-hans.tsv b/crates/ui-egui/src/i18n/zh-hans.tsv
+index d733ca8f00..fdb0f2ee77 100644
+--- a/crates/ui-egui/src/i18n/zh-hans.tsv
++++ b/crates/ui-egui/src/i18n/zh-hans.tsv
+@@ -2300,3 +2300,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	可用任意单位输入大小，例如 5 cm 或 300 px。另一边随之调整，图片保持原有比例。
+ 
+ 	Import…	导入…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	最小化
++	Maximize	最大化
++	Restore	还原
++	Use system title bar	使用系统标题栏
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	在 WordCraft 自己的标题栏上方显示带窗口按钮的基本标题栏。GNOME 不为应用绘制标题栏，因此此标题栏不跟随其主题。
+diff --git a/crates/ui-egui/src/i18n/zh-hant.tsv b/crates/ui-egui/src/i18n/zh-hant.tsv
+index a8bc708ea1..844a041d93 100644
+--- a/crates/ui-egui/src/i18n/zh-hant.tsv
++++ b/crates/ui-egui/src/i18n/zh-hant.tsv
+@@ -2289,3 +2289,9 @@
+ 	Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions.	可用任何單位輸入大小，例如 5 cm 或 300 px。另一邊隨之調整，圖片保持原有比例。
+ 
+ 	Import…	匯入…
++# Window buttons where the app draws the window frame (GNOME on Wayland).
++	Minimize	最小化
++	Maximize	最大化
++	Restore	還原
++	Use system title bar	使用系統標題列
++	Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme.	在 WordCraft 自己的標題列上方顯示帶有視窗按鈕的基本標題列。GNOME 不會為應用程式繪製標題列，因此此標題列不會跟隨其佈景主題。
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index c7f687a4e8..1321d3e95f 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -82,6 +82,7 @@ pub mod table_ruler;
+ pub mod theme;
+ pub mod widgets;
+ pub mod window_close;
++pub mod window_controls;
+ pub mod window_geometry;
+ pub mod wordart_menus;
+ pub mod zotero;
+@@ -305,6 +306,10 @@ pub struct UiState {
+     /// fades, as Word's does on Windows (on, the default), or it jumps and blinks on and off
+     /// (off).
+     pub caret_animation: bool,
++    /// File › Options › General › Use system title bar: where the desktop leaves the window frame
++    /// to the app ([`WordApp::window_controls`], GNOME on Wayland), keep winit's frame instead of
++    /// drawing the window buttons in the title bar.
++    pub system_title_bar: bool,
+     /// Custom keyboard shortcuts (Customize Keyboard, #368); the session owns them while running.
+     pub keyboard: wordcraft_engine::KeyMap,
+     /// Custom ribbon tabs and groups, hidden tabs and the Quick Access Toolbar (Customize Ribbon,
+@@ -387,6 +392,7 @@ impl Default for UiState {
+             alt_chord_used: false,
+             dark_page: false,
+             caret_animation: true,
++            system_title_bar: false,
+             keyboard: wordcraft_engine::KeyMap::default(),
+             ribbon: wordcraft_engine::RibbonLayout::default(),
+             caption_labels: Vec::new(),
+@@ -526,6 +532,12 @@ pub struct WordApp {
+     pub integrated_titlebar: bool,
+     /// macOS: the title bar's height and where its content starts, around the traffic lights.
+     pub mac_titlebar: chrome::MacTitleBar,
++    /// Set when the desktop leaves the window frame to the app (GNOME on Wayland): the title bar
++    /// carries these window buttons and the window's edges resize it.
++    pub window_controls: Option<window_controls::Layout>,
++    /// Whether the window currently has the app's frame rather than winit's (`None` until the
++    /// desktop app says how the window opened, or the first frame).
++    pub app_frame_shown: Option<bool>,
+     control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
+     shot_token: u64,
+     queued_shots: Vec<(u64, f64, u32)>,
+@@ -665,6 +677,8 @@ impl WordApp {
+             previews: previews::Previews::default(),
+             integrated_titlebar: false,
+             mac_titlebar: chrome::MacTitleBar::default(),
++            window_controls: None,
++            app_frame_shown: None,
+             control_rx: None,
+             shot_token: 0,
+             queued_shots: Vec::new(),
+@@ -1424,6 +1438,35 @@ impl WordApp {
+         }
+     }
+ 
++    /// Whether the app draws the window buttons and resize edges: the desktop leaves the frame to
++    /// the app and Use system title bar is off.
++    pub fn draws_window_frame(&self) -> bool {
++        self.window_controls.is_some() && !self.ui.system_title_bar
++    }
++
++    /// The window buttons to draw this frame: none where the desktop draws the frame, and none in
++    /// full screen.
++    pub(crate) fn shown_window_controls(&self, ctx: &egui::Context) -> Option<window_controls::Layout> {
++        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
++        self.window_controls.clone().filter(|_| self.draws_window_frame() && !fullscreen)
++    }
++
++    /// Follow Use system title bar at once: the window opens without winit's frame wherever the
++    /// app may draw its own (the desktop app's `main`), and gets it back, or loses it again, when
++    /// the setting changes.
++    fn sync_window_frame(&mut self, ctx: &egui::Context) {
++        if self.window_controls.is_none() {
++            return;
++        }
++        let app_frame = self.draws_window_frame();
++        if self.app_frame_shown != Some(app_frame) {
++            if self.app_frame_shown.is_some() {
++                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!app_frame));
++            }
++            self.app_frame_shown = Some(app_frame);
++        }
++    }
++
+     /// Follow the desktop's light/dark choice while the app runs (Linux, where winit reports no
+     /// system theme; see [`desktop_theme`]). The desktop app calls this once at start-up; unit
+     /// tests and `ui_shot` don't, so what they draw doesn't depend on the host's desktop theme.
+@@ -1694,6 +1737,17 @@ impl WordApp {
+                 }
+                 json!({"caretAnimation": self.ui.caret_animation})
+             }
++            "ui.systemTitleBar" => {
++                // File › Options › General › Use system title bar: `value` true gives the window
++                // winit's frame, false the app's own window buttons; no value reads it. It changes
++                // the window only where the desktop leaves the frame to the app (`appDrawsFrame`).
++                match p.get("value") {
++                    None => {}
++                    Some(Value::Bool(on)) => self.ui.system_title_bar = *on,
++                    Some(_) => return Some(Err("`value` must be true or false".into())),
++                }
++                json!({"systemTitleBar": self.ui.system_title_bar, "appDrawsFrame": self.draws_window_frame()})
++            }
+             "ui.alignmentGuides" => {
+                 // File › Options › Advanced › Editing: `value` true or false turns snapping to
+                 // alignment guides while moving pictures and shapes on or off; no value reads it.
+@@ -2212,7 +2266,15 @@ impl WordApp {
+         if !self.ui.backstage {
+             backstage::forget_open_error(&ctx);
+         }
++        self.sync_window_frame(&ctx);
++        if self.draws_window_frame() {
++            window_controls::resize_edges(&ctx);
++        }
+         if self.ui.backstage {
++            // The Backstage covers the title bar, so the window buttons get a bar of their own.
++            if let Some(layout) = self.shown_window_controls(&ctx) {
++                window_controls::backstage_header(ui, &layout);
++            }
+             backstage::show(self, ui);
+         } else if !self.has_document() {
+             // No document open (#1129): the ribbon greyed out but for Help, and no page.
+@@ -2605,6 +2667,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
+             | "ui.closeDialog"
+             | "ui.collapseRibbon"
+             | "ui.quickAccessToolbar"
++            | "ui.systemTitleBar"
+             | "ui.keytips"
+             | "ui.dark"
+             | "ui.theme"
+@@ -2935,6 +2998,97 @@ mod tests {
+         assert_eq!(c.run("ui.quickAccessToolbar", json!({"value": false})).unwrap()["quickAccessToolbar"], false, "works without a document");
+     }
+ 
++    /// The window-frame commands the last frame sent: `Decorations(on)`.
++    fn decorations_asked(h: &egui_kittest::Harness<'static, WordApp>) -> Option<bool> {
++        h.output().viewport_output.values().flat_map(|v| v.commands.iter()).find_map(|c| match c {
++            egui::ViewportCommand::Decorations(on) => Some(*on),
++            _ => None,
++        })
++    }
++
++    /// Steps a few frames and reports the first `Decorations` command among them.
++    fn step_for_decorations(h: &mut egui_kittest::Harness<'static, WordApp>) -> Option<bool> {
++        let mut asked = None;
++        for _ in 0..4 {
++            h.step();
++            asked = asked.or(decorations_asked(h));
++        }
++        asked
++    }
++
++    fn window_button_count(h: &egui_kittest::Harness<'static, WordApp>, label: &str) -> usize {
++        h.query_all_by_role_and_label(egui::accesskit::Role::Button, label).count()
++    }
++
++    /// GNOME on Wayland: the title bar carries the window buttons until File › Options › Use
++    /// system title bar gives the window back its frame, at once and without a restart; the
++    /// choice is saved, and the command turns it back off.
++    #[test]
++    fn use_system_title_bar_swaps_the_window_buttons_for_the_frame() {
++        let mut a = app();
++        a.window_controls = Some(window_controls::Layout::default());
++        let mut h = harness(a);
++        // The window opened without winit's frame, so the first frames ask for nothing.
++        assert_eq!(step_for_decorations(&mut h), None);
++        for label in ["Minimize", "Maximize"] {
++            assert_eq!(window_button_count(&h, label), 1, "the title bar has {label}");
++        }
++        h.state_mut().run("ui.backstage", json!({"value": true, "page": "options", "pane": "general"})).unwrap();
++        h.run_steps(2);
++        assert_eq!(window_button_count(&h, "Minimize"), 1, "File keeps the window buttons, in a bar of its own");
++        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Use system title bar").click();
++        assert_eq!(step_for_decorations(&mut h), Some(true), "the window gets its frame back");
++        assert!(h.state().ui.system_title_bar);
++        assert_eq!(window_button_count(&h, "Minimize"), 0, "and loses the app's buttons");
++        let saved = serde_json::to_string(&h.state().prefs()).unwrap();
++        assert!(saved.contains(r#""systemTitleBar":true"#), "{saved}");
++        let mut b = app();
++        b.apply_prefs(serde_json::from_str(&saved).unwrap());
++        assert!(b.ui.system_title_bar, "kept after a restart");
++        let old: UiState = serde_json::from_str(r#"{"tab":"Insert"}"#).unwrap();
++        assert!(!old.system_title_bar, "older settings draw the app's buttons");
++        assert_eq!(
++            h.state_mut().run("ui.systemTitleBar", json!({})).unwrap(),
++            json!({"systemTitleBar": true, "appDrawsFrame": false}),
++            "no value reads it"
++        );
++        assert!(h.state_mut().run("ui.systemTitleBar", json!({"value": "no"})).is_err());
++        assert_eq!(h.state_mut().run("ui.systemTitleBar", json!({"value": false})).unwrap(), json!({"systemTitleBar": false, "appDrawsFrame": true}));
++        assert_eq!(step_for_decorations(&mut h), Some(false), "the frame goes again");
++        assert_eq!(window_button_count(&h, "Minimize"), 1);
++        h.state_mut().run("ui.backstage", json!({"value": false})).unwrap();
++        h.run_steps(2);
++        assert_eq!(window_button_count(&h, "Minimize"), 1, "back in the title bar");
++    }
++
++    /// GNOME's `button-layout` decides which buttons appear: Fedora's default shows only close.
++    #[test]
++    fn the_desktop_button_layout_decides_the_window_buttons() {
++        let mut h = harness(app());
++        h.run_steps(2);
++        let closes = window_button_count(&h, "Close");
++        let mut a = app();
++        a.window_controls = Some(window_controls::Layout { left: vec![], right: vec![window_controls::Button::Close] });
++        let mut h = harness(a);
++        h.run_steps(2);
++        assert_eq!(window_button_count(&h, "Close"), closes + 1);
++        assert_eq!(window_button_count(&h, "Minimize"), 0);
++        assert_eq!(window_button_count(&h, "Maximize"), 0);
++    }
++
++    /// Where the desktop draws the frame there are no window buttons and nothing to choose.
++    #[test]
++    fn desktops_that_draw_the_frame_are_left_alone() {
++        let mut h = harness(app());
++        assert_eq!(step_for_decorations(&mut h), None);
++        assert_eq!(window_button_count(&h, "Minimize"), 0);
++        h.state_mut().run("ui.backstage", json!({"value": true, "page": "options", "pane": "general"})).unwrap();
++        h.run_steps(2);
++        assert!(h.query_by_label("Use system title bar").is_none());
++        assert_eq!(h.state_mut().run("ui.systemTitleBar", json!({"value": true})).unwrap(), json!({"systemTitleBar": true, "appDrawsFrame": false}));
++        assert_eq!(step_for_decorations(&mut h), None);
++    }
++
+     fn harness(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
+         egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+             |ui, app: &mut WordApp| {
+diff --git a/crates/ui-egui/src/options.rs b/crates/ui-egui/src/options.rs
+index 2907d7e045..abb30b9896 100644
+--- a/crates/ui-egui/src/options.rs
++++ b/crates/ui-egui/src/options.rs
+@@ -191,6 +191,17 @@ fn general(app: &mut WordApp, ui: &mut Ui) {
+         let _ = app.run("view.darkMode", json!({"value": dark_page}));
+     }
+     ui.checkbox(&mut app.ui.show_discord, tl!("Show the community button in the title bar"));
++    // Only where the app draws the window buttons (GNOME on Wayland); elsewhere the desktop
++    // draws the frame.
++    if app.window_controls.is_some() {
++        let mut system = app.ui.system_title_bar;
++        let hint = tl!(
++            "Show a basic title bar for the window buttons above WordCraft's own. GNOME doesn't draw title bars for apps, so this one doesn't follow its theme."
++        );
++        if ui.checkbox(&mut system, tl!("Use system title bar")).on_hover_text(hint).changed() {
++            let _ = app.run("ui.systemTitleBar", json!({"value": system}));
++        }
++    }
+     default_app_button(app, ui);
+     ui.add_space(8.0);
+     section(ui, "Start-up");
+diff --git a/crates/ui-egui/src/window_controls.rs b/crates/ui-egui/src/window_controls.rs
+new file mode 100644
+index 0000000000..bb948afcd9
+--- /dev/null
++++ b/crates/ui-egui/src/window_controls.rs
+@@ -0,0 +1,360 @@
++//! Window buttons and resize edges for desktops that leave the window frame to the app.
++//!
++//! GNOME on Wayland has no server-side decorations (the compositor offers no
++//! `zxdg_decoration_manager_v1`), so winit drew its own imitation frame above WordCraft's title
++//! bar. Instead the app turns that frame off and its title bar becomes the header bar, as in
++//! GNOME's own apps: it carries the minimize, maximize and close buttons in the desktop's order
++//! (GNOME's `button-layout`), and thin zones along the window's edges resize it. Desktops with
++//! server-side decorations (KDE, Sway, Hyprland, X11) keep their own frame and never get here.
++
++use crate::theme::Tokens;
++use egui::viewport::ResizeDirection;
++use egui::{Align2, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
++
++/// A window button.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Button {
++    Minimize,
++    Maximize,
++    Close,
++}
++
++/// Which buttons go on which end of the header bar, outermost last.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Layout {
++    pub left: Vec<Button>,
++    pub right: Vec<Button>,
++}
++
++impl Default for Layout {
++    /// What a desktop that names no layout gets: all three, on the right.
++    fn default() -> Self {
++        Self { left: Vec::new(), right: vec![Button::Minimize, Button::Maximize, Button::Close] }
++    }
++}
++
++impl Layout {
++    /// No buttons on either end.
++    pub fn none() -> Self {
++        Self { left: Vec::new(), right: Vec::new() }
++    }
++
++    /// GNOME's `org.gnome.desktop.wm.preferences button-layout`: `left:right`, each a comma list
++    /// such as `appmenu:minimize,maximize,close` (Fedora's default is `appmenu:close`). Without a
++    /// colon everything is on the left, as in GTK. Names this app has no button for (`appmenu`,
++    /// `icon`, `menu`, `spacer`) are skipped, and a button named twice appears once. `gsettings`
++    /// prints the value quoted; the quotes are dropped.
++    pub fn parse(value: &str) -> Self {
++        let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
++        let (left, right) = value.split_once(':').unwrap_or((value, ""));
++        let mut seen = Vec::new();
++        let mut side = |list: &str| {
++            let mut out = Vec::new();
++            for name in list.split(',') {
++                let button = match name.trim() {
++                    "minimize" => Button::Minimize,
++                    "maximize" => Button::Maximize,
++                    "close" => Button::Close,
++                    _ => continue,
++                };
++                if !seen.contains(&button) {
++                    seen.push(button);
++                    out.push(button);
++                }
++            }
++            out
++        };
++        let left = side(left);
++        let right = side(right);
++        Self { left, right }
++    }
++
++    /// The desktop's button layout, or minimize, maximize and close on the right when it names
++    /// none (or names one without a single button, which would leave no way to close the window
++    /// by mouse). Asks the XDG Desktop Portal, as [`crate::desktop_theme`] does, so it blocks for
++    /// one D-Bus round trip: call it once, at start-up.
++    pub fn desktop() -> Self {
++        match read_button_layout().map(|v| Self::parse(&v)) {
++            Some(layout) if !layout.left.is_empty() || !layout.right.is_empty() => layout,
++            _ => Self::default(),
++        }
++    }
++}
++
++#[cfg(target_os = "linux")]
++fn read_button_layout() -> Option<String> {
++    // Start-up waits on this reply, so a portal that never answers can't hold the window back. It
++    // is read only once, and the portal may be starting on demand at login, so allow it 2 s.
++    let connection = zbus::blocking::connection::Builder::session().ok()?.method_timeout(std::time::Duration::from_secs(2)).build().ok()?;
++    let reply = connection
++        .call_method(
++            Some("org.freedesktop.portal.Desktop"),
++            "/org/freedesktop/portal/desktop",
++            Some("org.freedesktop.portal.Settings"),
++            "ReadOne",
++            &("org.gnome.desktop.wm.preferences", "button-layout"),
++        )
++        .ok()?;
++    let (answer,) = reply.body().deserialize::<(zbus::zvariant::OwnedValue,)>().ok()?;
++    String::try_from(&*answer).ok()
++}
++
++#[cfg(not(target_os = "linux"))]
++fn read_button_layout() -> Option<String> {
++    None
++}
++
++/// The round button's diameter, as in Adwaita.
++pub const BUTTON: f32 = 24.0;
++/// Between two window buttons.
++pub const GAP: f32 = 6.0;
++/// Between the window buttons and the rest of the bar.
++pub const SIDE_GAP: f32 = 10.0;
++
++/// The width `buttons` take in the bar, without the gap to the rest of it.
++pub fn width(buttons: &[Button]) -> f32 {
++    match buttons.len() {
++        0 => 0.0,
++        n => n as f32 * BUTTON + (n - 1) as f32 * GAP,
++    }
++}
++
++/// Draw the window buttons for one end of the bar, in reading order, inside a horizontal layout
++/// running left to right; the caller adds [`SIDE_GAP`] where the bar continues.
++pub fn buttons(ui: &mut egui::Ui, buttons: &[Button]) {
++    let t = Tokens::get(ui.ctx());
++    let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
++    ui.spacing_mut().item_spacing.x = 0.0;
++    for (n, &button) in buttons.iter().enumerate() {
++        if n > 0 {
++            ui.add_space(GAP);
++        }
++        let label = tl!(match button {
++            Button::Minimize => "Minimize",
++            Button::Maximize if maximized => "Restore",
++            Button::Maximize => "Maximize",
++            Button::Close => "Close",
++        });
++        let (rect, response) = ui.allocate_exact_size(Vec2::splat(BUTTON), Sense::click());
++        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
++        let response = response.on_hover_text(label);
++        if ui.is_rect_visible(rect) {
++            paint(ui.painter(), rect, button, maximized, &t, &response);
++        }
++        if response.clicked() {
++            let command = match button {
++                Button::Minimize => egui::ViewportCommand::Minimized(true),
++                Button::Maximize => egui::ViewportCommand::Maximized(!maximized),
++                // The same path as the desktop's close: unsaved documents still ask first.
++                Button::Close => egui::ViewportCommand::Close,
++            };
++            ui.ctx().send_viewport_cmd(command);
++        }
++    }
++}
++
++/// Adwaita's look: a round wash of the text colour, stronger on hover and press, and a 16-point
++/// symbolic glyph drawn with lines (no icon files).
++fn paint(painter: &egui::Painter, rect: Rect, button: Button, maximized: bool, t: &Tokens, response: &egui::Response) {
++    let alpha = if response.is_pointer_button_down_on() {
++        0.28
++    } else if response.hovered() {
++        0.16
++    } else {
++        0.10
++    };
++    painter.circle_filled(rect.center(), BUTTON / 2.0, t.text.gamma_multiply(alpha));
++    if response.has_focus() {
++        painter.circle_stroke(rect.center(), BUTTON / 2.0 - 0.5, Stroke::new(1.0, t.accent));
++    }
++    let stroke = Stroke::new(1.25, t.text);
++    // The glyph's 16-point square, its corners on pixel centres so lines stay crisp.
++    let c = rect.center();
++    let at = |x: f32, y: f32| Pos2::new((c.x - 8.0 + x).round() + 0.5, (c.y - 8.0 + y).round() + 0.5);
++    match button {
++        Button::Minimize => {
++            painter.line_segment([at(4.0, 11.0), at(11.0, 11.0)], stroke);
++        }
++        Button::Maximize if maximized => {
++            // Restore: a smaller window in front of another.
++            painter.rect_stroke(Rect::from_two_pos(at(4.0, 6.0), at(10.0, 12.0)), 1.0, stroke, egui::StrokeKind::Middle);
++            painter.line_segment([at(6.0, 6.0), at(6.0, 4.0)], stroke);
++            painter.line_segment([at(6.0, 4.0), at(12.0, 4.0)], stroke);
++            painter.line_segment([at(12.0, 4.0), at(12.0, 10.0)], stroke);
++            painter.line_segment([at(12.0, 10.0), at(10.0, 10.0)], stroke);
++        }
++        Button::Maximize => {
++            painter.rect_stroke(Rect::from_two_pos(at(4.0, 4.0), at(11.0, 11.0)), 1.0, stroke, egui::StrokeKind::Middle);
++        }
++        Button::Close => {
++            painter.line_segment([at(4.0, 4.0), at(11.0, 11.0)], stroke);
++            painter.line_segment([at(11.0, 4.0), at(4.0, 11.0)], stroke);
++        }
++    }
++}
++
++/// The height of [`backstage_header`], as the title bar's.
++pub const HEADER: f32 = 38.0;
++
++/// File (the Backstage) covers the title bar, so where the app draws the frame a bar above it
++/// carries the window buttons, in the desktop's order, and drags the window.
++pub fn backstage_header(ui: &mut egui::Ui, layout: &Layout) {
++    let t = Tokens::get(ui.ctx());
++    egui::Panel::top("backstage_window_header")
++        .exact_size(HEADER)
++        .frame(egui::Frame::NONE.fill(t.title_bar).inner_margin(egui::Margin { left: 8, right: 10, top: 0, bottom: 0 }))
++        .show(ui, |ui| {
++            let full = ui.max_rect();
++            let drag = ui.interact(full, ui.id().with("header_drag"), Sense::click_and_drag());
++            if drag.drag_started() {
++                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
++            }
++            if drag.double_clicked() {
++                let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
++                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
++            }
++            ui.horizontal_centered(|ui| {
++                buttons(ui, &layout.left);
++                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                    // Laid out left to right inside the right-to-left run, so they read in the
++                    // desktop's order.
++                    let size = egui::vec2(width(&layout.right), BUTTON);
++                    ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| buttons(ui, &layout.right));
++                });
++            });
++        });
++}
++
++/// How far into the window an edge resizes it.
++const EDGE: f32 = 5.0;
++/// How far along an edge a corner reaches, so corners are easy to hit.
++const CORNER: f32 = 16.0;
++
++/// The resize zones of a window filling `rect`: edges `edge` deep, and each corner an L of two
++/// strips reaching `corner` along both edges (a square would reach into the content).
++fn zones(rect: Rect, edge: f32, corner: f32) -> Vec<(ResizeDirection, Rect)> {
++    let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
++    // Never inverted, however small the window.
++    let zone = |x0: f32, x1: f32, y0: f32, y1: f32| Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1.max(x0), y1.max(y0)));
++    vec![
++        (ResizeDirection::NorthWest, zone(l, l + corner, t, t + edge)),
++        (ResizeDirection::NorthWest, zone(l, l + edge, t + edge, t + corner)),
++        (ResizeDirection::NorthEast, zone(r - corner, r, t, t + edge)),
++        (ResizeDirection::NorthEast, zone(r - edge, r, t + edge, t + corner)),
++        (ResizeDirection::SouthWest, zone(l, l + corner, b - edge, b)),
++        (ResizeDirection::SouthWest, zone(l, l + edge, b - corner, b - edge)),
++        (ResizeDirection::SouthEast, zone(r - corner, r, b - edge, b)),
++        (ResizeDirection::SouthEast, zone(r - edge, r, b - corner, b - edge)),
++        (ResizeDirection::North, zone(l + corner, r - corner, t, t + edge)),
++        (ResizeDirection::South, zone(l + corner, r - corner, b - edge, b)),
++        (ResizeDirection::West, zone(l, l + edge, t + corner, b - corner)),
++        (ResizeDirection::East, zone(r - edge, r, t + corner, b - corner)),
++    ]
++}
++
++fn cursor(direction: ResizeDirection) -> CursorIcon {
++    match direction {
++        ResizeDirection::North => CursorIcon::ResizeNorth,
++        ResizeDirection::South => CursorIcon::ResizeSouth,
++        ResizeDirection::East => CursorIcon::ResizeEast,
++        ResizeDirection::West => CursorIcon::ResizeWest,
++        ResizeDirection::NorthEast => CursorIcon::ResizeNorthEast,
++        ResizeDirection::SouthEast => CursorIcon::ResizeSouthEast,
++        ResizeDirection::NorthWest => CursorIcon::ResizeNorthWest,
++        ResizeDirection::SouthWest => CursorIcon::ResizeSouthWest,
++    }
++}
++
++/// Resize zones along the window's edges and a hairline border, while the window is neither
++/// maximized nor full screen. The zones sit above everything else (in the foreground order), so a
++/// press there resizes instead of reaching the scrollbar or ruler under it.
++pub fn resize_edges(ctx: &egui::Context) {
++    let (maximized, fullscreen) = ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
++    if maximized || fullscreen {
++        return;
++    }
++    let screen = ctx.content_rect();
++    let t = Tokens::get(ctx);
++    egui::Area::new(egui::Id::new("window_resize_edges"))
++        .order(egui::Order::Foreground)
++        .fixed_pos(screen.min)
++        .pivot(Align2::LEFT_TOP)
++        .interactable(true)
++        .show(ctx, |ui| {
++            ui.set_min_size(Vec2::ZERO);
++            for (n, (direction, rect)) in zones(screen, EDGE, CORNER).into_iter().enumerate() {
++                if rect.width() <= 0.0 || rect.height() <= 0.0 {
++                    continue;
++                }
++                let response = ui.interact(rect, ui.id().with(("edge", n)), Sense::drag()).on_hover_cursor(cursor(direction));
++                // Sensing only drags, a drag starts on the press itself.
++                if response.drag_started() {
++                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
++                }
++            }
++            // Without the desktop's frame or shadow, a hairline keeps the window apart from
++            // what's behind it.
++            ui.painter().rect_stroke(
++                screen,
++                0.0,
++                Stroke::new(1.0, Color32::from_black_alpha(if t.dark { 160 } else { 60 })),
++                egui::StrokeKind::Inside,
++            );
++        });
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{Button, Layout, ResizeDirection, zones};
++    use egui::{Pos2, Rect};
++
++    #[test]
++    fn gnome_button_layouts_parse() {
++        let close = Layout { left: vec![], right: vec![Button::Close] };
++        assert_eq!(Layout::parse("'appmenu:close'"), close);
++        assert_eq!(Layout::parse("appmenu:close\n"), close);
++        assert_eq!(Layout::parse(":minimize,maximize,close"), Layout::default());
++        assert_eq!(
++            Layout::parse("close,minimize,maximize:appmenu"),
++            Layout { left: vec![Button::Close, Button::Minimize, Button::Maximize], right: vec![] }
++        );
++        // No colon: the left side, as GTK reads it.
++        assert_eq!(Layout::parse("close"), Layout { left: vec![Button::Close], right: vec![] });
++        // Unknown names, spaces and repeats.
++        assert_eq!(Layout::parse("icon,spacer: close , close,bogus"), close);
++        assert_eq!(Layout::parse(""), Layout::none());
++    }
++
++    #[test]
++    fn widths_cover_the_buttons_and_their_gaps() {
++        assert_eq!(super::width(&[]), 0.0);
++        assert_eq!(super::width(&[Button::Close]), super::BUTTON);
++        assert_eq!(super::width(&Layout::default().right), 3.0 * super::BUTTON + 2.0 * super::GAP);
++    }
++
++    #[test]
++    fn resize_zones_line_the_edges_without_overlapping() {
++        let window = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
++        let zones = zones(window, 5.0, 16.0);
++        let at = |x: f32, y: f32| zones.iter().filter(|(_, r)| r.contains(Pos2::new(x, y))).map(|(d, _)| *d).collect::<Vec<_>>();
++        assert_eq!(at(1.0, 1.0), [ResizeDirection::NorthWest]);
++        assert_eq!(at(2.0, 12.0), [ResizeDirection::NorthWest]);
++        assert_eq!(at(400.0, 2.0), [ResizeDirection::North]);
++        assert_eq!(at(799.0, 300.0), [ResizeDirection::East]);
++        assert_eq!(at(400.0, 599.0), [ResizeDirection::South]);
++        assert_eq!(at(1.0, 300.0), [ResizeDirection::West]);
++        assert_eq!(at(799.0, 599.0), [ResizeDirection::SouthEast]);
++        assert!(at(400.0, 300.0).is_empty(), "the middle of the window is left alone");
++        assert!(at(12.0, 12.0).is_empty(), "corners stay along the edges");
++        // Strips meet without overlapping.
++        for y in [0.5, 4.5, 5.5, 15.5, 16.5, 595.5] {
++            for x in [0.5, 4.5, 5.5, 15.5, 16.5, 795.5, 799.5] {
++                assert!(at(x, y).len() <= 1, "({x}, {y}): {:?}", at(x, y));
++            }
++        }
++        // A window smaller than its corners gets empty (not inverted) edge zones.
++        for (_, r) in super::zones(Rect::from_min_size(Pos2::ZERO, egui::vec2(20.0, 20.0)), 5.0, 16.0) {
++            assert!(r.width() >= 0.0 && r.height() >= 0.0);
++        }
++    }
++}
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index f85b7587cc..a9f2ee58f2 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -52,7 +52,7 @@ and set `WORDCRAFT_CONTROL_KEY` to that app's key.
+ 
+ | Method | Params | Result |
+ |---|---|---|
+-| `engine.execute` | `command`, `params` | the command's result (any id from `engine.commands`, including UI commands `ui.tab`, `ui.dialog` (`{"name": dialog, "part"?: table style part}`; `part` opens New / Modify Table Style (`newTableStyle` / `modifyTableStyle`) on that part: `wholeTable`, `headerRow`, `firstColumn`, `bandedRows`, `nwCell`… as `table.modifyStyle` names them), `ui.backstage`, `ui.zotero.*` (see `docs/zotero.md`), `ui.language` (`{"value": "auto"|"en"|"zh-hans"|"zh-hant"|"ja"|"pt-br"|"es"|"uk"|"sr"|"sr-latn"|"et"|"tr"|"ru"|"pl"|"de"|"it"|"cs"|"hu"|"fr"}`), `ui.theme` (`{"value": "system"|"light"|"dark"}`; `system` follows the OS appearance, light when it reports none), `ui.interfaceSize` (`{"value": "auto"}` or `{"percent": 50–300}`, clamped; no value reads it; `auto` keeps the system display scale, a percentage is absolute, so 100 is one screen pixel per point (#822); the result's `percent` is the size drawn at and `auto` whether it follows the system; document zoom stays `view.zoom`), `ui.animations` (`{"value": "system"|"on"|"off"}`; no value reads it; `system` follows the system's animation setting, which the desktop app reads on Windows, macOS, Linux and the BSDs and the web app from `prefers-reduced-motion`, and means on where the system doesn't say; the result's `enabled` is what the setting comes to and `system` what the system reports, `null` when it doesn't say), `ui.fileBrowser` (desktop: `{"purpose": "document"|"picture"|"recipients"|"save"}` opens WordCraft's own file browser, for when the system file dialog doesn't show up, #576), `ui.caretAnimation` (`{"value": true|false}`; no value reads it; off, the caret jumps and blinks on and off instead of gliding and fading), `ui.startScreen` (`{"value": true|false}`; no value reads it; on, the default, the desktop and web apps start on File › Home when launched with nothing to open, #766), `ui.alignmentGuides` (`{"value": true|false}`; no value reads it; on, the default, moving a picture or shape snaps it to the page, the margins and other objects, with guide lines while dragging; Alt moves freely), `ui.quickAccessToolbar` (`{"value": true|false}`; no value toggles it; false takes the Quick Access Toolbar out of the title bar, as its menu's Hide Quick Access Toolbar does, and true brings it back, #1945)…) |
++| `engine.execute` | `command`, `params` | the command's result (any id from `engine.commands`, including UI commands `ui.tab`, `ui.dialog` (`{"name": dialog, "part"?: table style part}`; `part` opens New / Modify Table Style (`newTableStyle` / `modifyTableStyle`) on that part: `wholeTable`, `headerRow`, `firstColumn`, `bandedRows`, `nwCell`… as `table.modifyStyle` names them), `ui.backstage`, `ui.zotero.*` (see `docs/zotero.md`), `ui.language` (`{"value": "auto"|"en"|"zh-hans"|"zh-hant"|"ja"|"pt-br"|"es"|"uk"|"sr"|"sr-latn"|"et"|"tr"|"ru"|"pl"|"de"|"it"|"cs"|"hu"|"fr"}`), `ui.theme` (`{"value": "system"|"light"|"dark"}`; `system` follows the OS appearance, light when it reports none), `ui.interfaceSize` (`{"value": "auto"}` or `{"percent": 50–300}`, clamped; no value reads it; `auto` keeps the system display scale, a percentage is absolute, so 100 is one screen pixel per point (#822); the result's `percent` is the size drawn at and `auto` whether it follows the system; document zoom stays `view.zoom`), `ui.animations` (`{"value": "system"|"on"|"off"}`; no value reads it; `system` follows the system's animation setting, which the desktop app reads on Windows, macOS, Linux and the BSDs and the web app from `prefers-reduced-motion`, and means on where the system doesn't say; the result's `enabled` is what the setting comes to and `system` what the system reports, `null` when it doesn't say), `ui.fileBrowser` (desktop: `{"purpose": "document"|"picture"|"recipients"|"save"}` opens WordCraft's own file browser, for when the system file dialog doesn't show up, #576), `ui.caretAnimation` (`{"value": true|false}`; no value reads it; off, the caret jumps and blinks on and off instead of gliding and fading), `ui.startScreen` (`{"value": true|false}`; no value reads it; on, the default, the desktop and web apps start on File › Home when launched with nothing to open, #766), `ui.alignmentGuides` (`{"value": true|false}`; no value reads it; on, the default, moving a picture or shape snaps it to the page, the margins and other objects, with guide lines while dragging; Alt moves freely), `ui.quickAccessToolbar` (`{"value": true|false}`; no value toggles it; false takes the Quick Access Toolbar out of the title bar, as its menu's Hide Quick Access Toolbar does, and true brings it back, #1945), `ui.systemTitleBar` (`{"value": true|false}`; no value reads it; true gives the window winit's frame instead of the app's window buttons; it changes the window only where the desktop leaves the frame to the app, GNOME on Wayland, which the result's `appDrawsFrame` reports, #78)…) |
+ | `engine.execute` | `command`, `params` | the command's result (any id from `engine.commands`, including UI commands `ui.tab`, `ui.dialog` (`{"name": dialog, "part"?: table style part}`; `part` opens New / Modify Table Style (`newTableStyle` / `modifyTableStyle`) on that part: `wholeTable`, `headerRow`, `firstColumn`, `bandedRows`, `nwCell`… as `table.modifyStyle` names them), `ui.backstage`, `ui.zotero.*` (see `docs/zotero.md`), `ui.language` (`{"value": "auto"|"en"|"zh-hans"|"zh-hant"|"ja"|"pt-br"|"es"|"uk"|"sr"|"sr-latn"|"et"|"tr"|"ru"}`), `ui.theme` (`{"value": "system"|"light"|"dark"}`; `system` follows the OS appearance, light when it reports none), `ui.interfaceSize` (`{"value": "auto"}` or `{"percent": 50–300}`, clamped; no value reads it; `auto` keeps the system display scale, a percentage is absolute, so 100 is one screen pixel per point (#822); the result's `percent` is the size drawn at and `auto` whether it follows the system; document zoom stays `view.zoom`), `ui.animations` (`{"value": "system"|"on"|"off"}`; no value reads it; `system` follows the system's animation setting, which the desktop app reads on Windows, macOS, Linux and the BSDs and the web app from `prefers-reduced-motion`, and means on where the system doesn't say; the result's `enabled` is what the setting comes to and `system` what the system reports, `null` when it doesn't say), `ui.fileBrowser` (desktop: `{"purpose": "document"|"picture"|"recipients"|"save"}` opens WordCraft's own file browser, for when the system file dialog doesn't show up, #576), `ui.caretAnimation` (`{"value": true|false}`; no value reads it; off, the caret jumps and blinks on and off instead of gliding and fading), `ui.contextMenu` (opens the page's context menu below the caret, as Shift+F10 does)…) |
+ | `engine.commands` | — | every command: id, label, location, shortcut, params, enabled |
+ | `document.inspect` | `text?` | blocks (text, style, runs, lists, tables), parts, sections, selection, pages |
+diff --git a/docs/ui-parity.md b/docs/ui-parity.md
+index d4948067e1..04ad8c8347 100644
+--- a/docs/ui-parity.md
++++ b/docs/ui-parity.md
+@@ -1,6 +1,6 @@
+ # UI parity with Microsoft Word
+ 
+-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-18 · **Change:** trivial (long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: dragging the vertical scrollbar names the page at the top of the window, #2551; previously trivial: Add Font imports every selected font file, #1789); previously trivial (File › Close keeps the window, #1712; previously trivial: the Spike: Ctrl+F3 and Ctrl+Shift+F3; previously trivial: Ctrl+wheel zoom no longer scrolls the document, #1743; previously trivial: a mouse drag on a table leaves the view where it is, #1738; previously trivial: numbered headings, #1793; previously trivial: Navigation Find exposes Results, #2096; previously trivial: the tab strip never draws tabs over Comments / Editing / Share, #2026; previously trivial: Columns on selected text, #2024; previously trivial: Different First Page headers reachable from page 1, #2826; previously trivial: a copied equation also goes in the clipboard's MathML formats, #1297; previously trivial: Read Mode keeps the keyboard, shows whole columns and keeps text clear of the page-turn bar, #1772); previously trivial: font list entries of tall-ascent fonts sit in their row, not cut off, #2570); previously trivial: Split Cells and Convert Text to Table dialogs follow Word's merged-cell limits and Initial column width, #2592; previously trivial: a new source's Tag is made like Word's, three letters of the author and two digits of the year with a number added when taken, and an edit keeps the Tag, #2094; previously trivial: Web Layout text fills the window width, #1876; previously trivial: Language dialog keeps inherited proofing language and no-proof choices (#2717)); previously trivial: comment balloons readable in the dark theme, #2045; previously trivial: Recently Used Fonts section at the top of the font list, #2068; previously trivial: web preferences kept between visits, #2132; previously trivial: dialog close control: a Windows-style box at the title bar's right end, the whole box clickable, red on hover, #1885); previously trivial (Modify Table Style formats every table style part, #714); previously trivial: a click on the ribbon chrome hands the keyboard to the page in the same frame, #1093 follow-up; previously trivial: Page Setup vertical alignment, #1320; previously trivial: the app opens on the Home tab every launch, as in Word; previously trivial: no document behind the Start screen, #1129; previously trivial: equation pictures share a few textures, #1002; previously trivial: selection bar in the left margin, #856; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously major: first version; ribbon, dialogs, shortcuts and on-canvas interaction measured from `crates/ui-egui` and the command registry) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
++> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-20 · **Change:** trivial (GNOME on Wayland: the title bar carries Adwaita-style window buttons instead of winit's fallback frame, #78; previously trivial: long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: dragging the vertical scrollbar names the page at the top of the window, #2551; previously trivial: Add Font imports every selected font file, #1789); previously trivial (File › Close keeps the window, #1712; previously trivial: the Spike: Ctrl+F3 and Ctrl+Shift+F3; previously trivial: Ctrl+wheel zoom no longer scrolls the document, #1743; previously trivial: a mouse drag on a table leaves the view where it is, #1738; previously trivial: numbered headings, #1793; previously trivial: Navigation Find exposes Results, #2096; previously trivial: the tab strip never draws tabs over Comments / Editing / Share, #2026; previously trivial: Columns on selected text, #2024; previously trivial: Different First Page headers reachable from page 1, #2826; previously trivial: a copied equation also goes in the clipboard's MathML formats, #1297; previously trivial: Read Mode keeps the keyboard, shows whole columns and keeps text clear of the page-turn bar, #1772); previously trivial: font list entries of tall-ascent fonts sit in their row, not cut off, #2570); previously trivial: Split Cells and Convert Text to Table dialogs follow Word's merged-cell limits and Initial column width, #2592; previously trivial: a new source's Tag is made like Word's, three letters of the author and two digits of the year with a number added when taken, and an edit keeps the Tag, #2094; previously trivial: Web Layout text fills the window width, #1876; previously trivial: Language dialog keeps inherited proofing language and no-proof choices (#2717)); previously trivial: comment balloons readable in the dark theme, #2045; previously trivial: Recently Used Fonts section at the top of the font list, #2068; previously trivial: web preferences kept between visits, #2132; previously trivial: dialog close control: a Windows-style box at the title bar's right end, the whole box clickable, red on hover, #1885); previously trivial (Modify Table Style formats every table style part, #714); previously trivial: a click on the ribbon chrome hands the keyboard to the page in the same frame, #1093 follow-up; previously trivial: Page Setup vertical alignment, #1320; previously trivial: the app opens on the Home tab every launch, as in Word; previously trivial: no document behind the Start screen, #1129; previously trivial: equation pictures share a few textures, #1002; previously trivial: selection bar in the left margin, #856; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously major: first version; ribbon, dialogs, shortcuts and on-canvas interaction measured from `crates/ui-egui` and the command registry) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+ 
+ How WordCraft looks and feels next to Word: ribbon, dialogs, panes, keyboard, mouse and touch.
+ Typing behaviour has its own checklist ([`typing-parity.md`](typing-parity.md)). All assets are our
+@@ -56,7 +56,7 @@ Document title opens Rename Document; the account badge opens Options › Genera
+ | Animation effects (File › Options › Accessibility: Use system setting, On, Off; `ui.animations`). Off: a wheel notch scrolls at once; Ctrl+wheel zooms in whole steps, each drawn finished in its own frame (a notch at once; touchpad pinches and high-resolution wheels in steps of about 10% rather than gliding); menus, buttons and the scroll to the caret neither fade nor glide | ✅ "Use system setting" reads Windows (Animation effects), macOS (Reduce motion), the Linux/BSD desktops (settings portal: the cross-desktop reduced-motion preference, GNOME's switch, KDE's animation speed; the GTK and KDE settings files where no portal answers) and browsers (`prefers-reduced-motion`), and follows a change while running. Run on Windows and against a stand-in portal on Linux; not yet tried on a Mac or a real GNOME or KDE session | not compared | 90% | 0.5–1 |
+ | Full screen (#980): View › Window › Full Screen (`view.fullScreen`), F11 (⌃⌘F on macOS) toggles OS-level full screen, Escape leaves it, leaving gives back the earlier window size; the window manager's or macOS's own full screen keeps it in step. In the browser it's off (the browser's own F11) | ✅ | Word for Mac: View › Enter Full Screen (⌃⌘F); Word for Windows: Full Screen Mode hides the ribbon only | 100% | — |
+ | File dialogs (Open, Save As, Export, Insert Picture) | system dialog, without blocking the window (#94), its Save As type list naming every format with the document's own first (#1399); Linux/BSD without a file chooser portal or zenity: WordCraft's own browser, also File › Open › Browse in WordCraft… (#576) | system dialog | 95% | — |
+-| Platform conventions (macOS menus/traffic lights #255, Windows title bar, Linux CSD on Wayland #78) | partial | native | 70% | 3–5 |
++| Platform conventions (macOS menus/traffic lights #255, Windows title bar, Linux CSD on Wayland #78: where the compositor draws no frames (GNOME), the title bar is the header bar, with Adwaita-style minimize, maximize and close in GNOME's `button-layout` order, resize edges, and File › Options › General › Use system title bar for winit's frame instead; `ui.systemTitleBar`, `WORDCRAFT_TITLEBAR=app\|system`) | partial | native | 75% | 3–5 |
+ | Screen readers (VoiceOver, Narrator, Orca) | AccessKit on; the document canvas describes paragraphs, headings (level), list items, tables, links, pictures (alt text) and the caret and selection, for the pages on screen (#488); Windows Magnifier follows the caret, also onto an empty line after Enter or Shift+Enter (#1119); not yet tried with real screen readers | full | 50% | 5–8 |
+ | Right-to-left (mirrored) interface | ❌ | ✅ (Arabic, Hebrew Word) | 0% | in localization |
+ 
+@@ -93,6 +93,7 @@ Footnote and endnote editing keeps body and note text at normal opacity, on ligh
+ | 2026-10-17 | trivial | Language dialog keeps inherited proofing language and no-proof choices (#2717); readiness estimates unchanged |
+ | 2026-10-16 | trivial | Create Source: automatic Tag like Word's (`Smi20`, `Kim001`); Edit Source keeps the Tag and citations show the new Author and Year (#2094; Word for Mac 16.113.4, user-checked) |
+ | 2026-10-18 | trivial | Split Cells on a merged cell: non-divisor row counts refused with a divisor message, 1 × 1 on a merged cell does nothing (#2592 follow-up) |
++| 2026-10-20 | trivial | GNOME on Wayland: winit's fallback frame is off and the title bar carries Adwaita-style window buttons in the desktop's `button-layout` order (File gets a bar of its own for them), the window's edges resize it, and File › Options › General › Use system title bar brings winit's frame back without a restart (#78; ported from GridCraft and PdfCraft) |
+ | 2026-10-18 | trivial | Split Cells merged-cell limits and equal parts, Convert Text to Table Initial column width, both from the Word check (#2592) |
+ | 2026-10-16 | trivial | Split Cells and Convert Text to Table dialogs (#2592): 58 modal dialogs |
+ | 2026-10-16 | trivial | Font list: each entry's capitals are centred in its row, so a font with a very tall ascent (Amiri, Amiri Quran) no longer sits low or is cut in half, and the list reads as one even list (#2570) |
+
+From d6fa99c003e1bfcc5941df1f434aff014be99b7f Mon Sep 17 00:00:00 2001
+From: bmh129 <11478682+bmh129@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:31:36 -0500
+Subject: [PATCH 6/7] ROADMAP: progress log for the GNOME title bar
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ROADMAP.md | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ROADMAP.md b/ROADMAP.md
+index cb9b4e9e66..dd3bafeaa7 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -2,7 +2,7 @@
+ 
+ **Stage: alpha** · next: beta, ~15 points (60% → 75% ready for real work) and ~150–230 h away
+ 
+-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-20 · **Change:** trivial (progress log: native Wayland by default on Linux, WORDCRAFT_X11=1 for XWayland; X11 libraries optional; previously trivial: progress log: caret inside ligatures, #1974; previously trivial: text typed into a content control takes the control's formatting; localized placeholder styles recognised; previously trivial: forms protection keeps its content controls: no inserting, Properties or Remove Content Control; previously trivial: long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: a word after a slash wraps whole, like Word, #2963; previously trivial: progress log: a header-cell picture watermark sits behind the text, #1775; previously trivial: symbols keep their font when the text font changes, #2036; previously trivial: opening a DOCX no longer copies its pictures; previously trivial: Add Font imports every selected font file, #1789); previously trivial (RTF export writes sections (gap 19); previously trivial: ODT export writes sections (gap 19); previously trivial: Read Aloud speaks each sentence in its own language, #1843; previously trivial: hint-reliant CJK outlines; previously trivial: Ctrl+wheel zoom no longer scrolls the document, #1743; previously trivial: progress log: Turkish case mapping in AutoCorrect, #1923; previously trivial: a mouse drag on a table leaves the view where it is, #1738; previously trivial: progress log: Hebrew field results and smart quotes, #1670; previously trivial: Backspace removes a selected table, rows or columns, #1844; previously trivial: progress log: mixed Hebrew/Latin text keeps its order in Word, #1543; previously trivial: progress log: web typing in non-Latin text no longer repeats, #1480; previously trivial: progress log: font family caches bounded and math font lookups follow font changes, #1354; previously trivial: `-->` AutoCorrect replacement, #2223; previously trivial: numbered headings, #1793; previously trivial: Navigation Find exposes Results, #2096; previously trivial: progress log: Columns on selected text, #2024; previously trivial: progress log: legacy outline, shadow, emboss and imprint text effects drawn, #2534; previously trivial: progress log: Indonesian proofing, #498; previously trivial: progress log: DOCX glossary documents (building blocks); previously trivial: progress log: Read Mode keeps the keyboard and shows whole, unobscured columns, #1772); previously trivial: progress log: font list entries of tall-ascent fonts no longer cut off, #2570); previously trivial: progress log: Split Cells and Convert Text to Table dialogs follow the Word check, #2592; previously trivial: a new source's Tag is made like Word's, three letters of the author and two digits of the year with a number added when taken, and an edit keeps the Tag, #2094; previously trivial: Web Layout fills the window width, #1876; previously trivial: progress log: Different First Page headers reachable from page 1, #2826; previously trivial: Language dialog keeps inherited proofing language and no-proof choices (#2717); previously trivial: progress log: web preferences kept between visits, #2132; previously trivial: progress log: undrawable private-use list bullets show the level's default bullet, #1683; previously trivial: progress log: `w:eastAsianLayout` kept on save; previously trivial: table style editor formats every part, #714); previously trivial: VML freeforms read and kept on save; previously trivial: progress log: consistent preferred cell widths; previously trivial: multi-paragraph field instructions no longer add blank lines; previously trivial: page-break-only list paragraphs hide their labels; previously trivial: progress log: grouped `flowChartOr` shapes draw their circle and crossing spokes; previously trivial: progress log: copies keep their formatting in other programs, #1523; previously trivial: progress log: privacy options on save, #1062; previously trivial: progress log: equation pictures in theme colours on Windows, #1002; previously trivial: symbol fonts, #776; previously trivial: the save prompt answers from the keyboard, #861; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously trivial: formatting revisions landed, #41; previously trivial: Draw tab ink, #307, and Draw Table and Eraser, #303, landed: catalog 402/434; previously minor: readiness table with hours per audience; full number back to the additive weighted sum, 60%; mainstream and essentials numbers added; alpha gate checked; previously major: full re-measure against Word for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
++> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-20 · **Change:** trivial (progress log: GNOME-style window buttons in the title bar on Wayland, #78; previously trivial: progress log: native Wayland by default on Linux, WORDCRAFT_X11=1 for XWayland; X11 libraries optional; previously trivial: progress log: caret inside ligatures, #1974; previously trivial: text typed into a content control takes the control's formatting; localized placeholder styles recognised; previously trivial: forms protection keeps its content controls: no inserting, Properties or Remove Content Control; previously trivial: long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: a word after a slash wraps whole, like Word, #2963; previously trivial: progress log: a header-cell picture watermark sits behind the text, #1775; previously trivial: symbols keep their font when the text font changes, #2036; previously trivial: opening a DOCX no longer copies its pictures; previously trivial: Add Font imports every selected font file, #1789); previously trivial (RTF export writes sections (gap 19); previously trivial: ODT export writes sections (gap 19); previously trivial: Read Aloud speaks each sentence in its own language, #1843; previously trivial: hint-reliant CJK outlines; previously trivial: Ctrl+wheel zoom no longer scrolls the document, #1743; previously trivial: progress log: Turkish case mapping in AutoCorrect, #1923; previously trivial: a mouse drag on a table leaves the view where it is, #1738; previously trivial: progress log: Hebrew field results and smart quotes, #1670; previously trivial: Backspace removes a selected table, rows or columns, #1844; previously trivial: progress log: mixed Hebrew/Latin text keeps its order in Word, #1543; previously trivial: progress log: web typing in non-Latin text no longer repeats, #1480; previously trivial: progress log: font family caches bounded and math font lookups follow font changes, #1354; previously trivial: `-->` AutoCorrect replacement, #2223; previously trivial: numbered headings, #1793; previously trivial: Navigation Find exposes Results, #2096; previously trivial: progress log: Columns on selected text, #2024; previously trivial: progress log: legacy outline, shadow, emboss and imprint text effects drawn, #2534; previously trivial: progress log: Indonesian proofing, #498; previously trivial: progress log: DOCX glossary documents (building blocks); previously trivial: progress log: Read Mode keeps the keyboard and shows whole, unobscured columns, #1772); previously trivial: progress log: font list entries of tall-ascent fonts no longer cut off, #2570); previously trivial: progress log: Split Cells and Convert Text to Table dialogs follow the Word check, #2592; previously trivial: a new source's Tag is made like Word's, three letters of the author and two digits of the year with a number added when taken, and an edit keeps the Tag, #2094; previously trivial: Web Layout fills the window width, #1876; previously trivial: progress log: Different First Page headers reachable from page 1, #2826; previously trivial: Language dialog keeps inherited proofing language and no-proof choices (#2717); previously trivial: progress log: web preferences kept between visits, #2132; previously trivial: progress log: undrawable private-use list bullets show the level's default bullet, #1683; previously trivial: progress log: `w:eastAsianLayout` kept on save; previously trivial: table style editor formats every part, #714); previously trivial: VML freeforms read and kept on save; previously trivial: progress log: consistent preferred cell widths; previously trivial: multi-paragraph field instructions no longer add blank lines; previously trivial: page-break-only list paragraphs hide their labels; previously trivial: progress log: grouped `flowChartOr` shapes draw their circle and crossing spokes; previously trivial: progress log: copies keep their formatting in other programs, #1523; previously trivial: progress log: privacy options on save, #1062; previously trivial: progress log: equation pictures in theme colours on Windows, #1002; previously trivial: symbol fonts, #776; previously trivial: the save prompt answers from the keyboard, #861; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously trivial: formatting revisions landed, #41; previously trivial: Draw tab ink, #307, and Draw Table and Eraser, #303, landed: catalog 402/434; previously minor: readiness table with hours per audience; full number back to the additive weighted sum, 60%; mainstream and essentials numbers added; alpha gate checked; previously major: full re-measure against Word for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+ > **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-18 · **Change:** trivial (long navigation headings wrap onto further lines within the pane, #3015; previously trivial: clearing a no-match font query keeps the recent heading visible, #2068; previously trivial: a word after a slash wraps whole, like Word, #2963; previously trivial: RTF export writes sections (gap 19); previously trivial: ODT export writes sections (gap 19); previously trivial: progress log: pasted blockquotes are indented paragraphs, #1270; previously trivial: progress log: print-area strings translated in every catalog; previously trivial: progress log: comments readable in the dark theme, #2045; previously trivial: progress log: ODT sections, #1379; previously trivial: progress log: table deletes, Change Case and Unlink Fields respect Track Changes and locked content controls, #1329; previously trivial: progress log: rounded rectangle corners, #1476; previously trivial: progress log: Save As type list, #1399; previously trivial: progress log: privacy options on save, #1062; previously trivial: progress log: equation pictures in theme colours on Windows, #1002; previously trivial: symbol fonts, #776; previously trivial: the save prompt answers from the keyboard, #861; previously trivial: table column and row markers on the rulers, #700; previously trivial: table borders and the resize handle drag on the page, #217; previously trivial: formatting revisions landed, #41; previously trivial: Draw tab ink, #307, and Draw Table and Eraser, #303, landed: catalog 402/434; previously minor: readiness table with hours per audience; full number back to the additive weighted sum, 60%; mainstream and essentials numbers added; alpha gate checked; previously major: full re-measure against Word for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+ > **Printing update:** 2026-10-12 · direct desktop printing through craft-print; details below.
+ 
+@@ -141,6 +141,7 @@ Imported Word 97–2003 `.doc`/`.dot` files now ask for a supported DOCX target
+ - 2026-10-15: Find opens Navigation on Results; editing the query restores Results after manual Headings/Pages navigation. Typed and selected-text searches retain document contents (#2096).
+ 
+ | Date | What landed |
++| 2026-10-20 | GNOME on Wayland (#78): winit's fallback frame is off and the title bar carries Adwaita-style minimize, maximize and close in the order GNOME's button layout names, with resize edges; File gets a bar of its own for them. File › Options › General › Use system title bar brings winit's frame back without a restart (`ui.systemTitleBar`); `WORDCRAFT_TITLEBAR=app\|system` overrides the detection. Desktops that draw frames (KDE, Sway, Hyprland, COSMIC, X11) are unchanged. |
+ | 2026-10-20 | Linux: the app runs on the native Wayland backend on Wayland desktops (sharp at fractional scales, input methods work: #1382, #68, #2932, #2933, #1240); `WORDCRAFT_X11=1` runs through XWayland for file drag-and-drop, which winit 0.30 supports only on X11 (#220). Without the X11 libraries (only recommended by the packages) that setting is ignored instead of the app failing to start; the rpm also recommends `libX11-xcb`, which winit opens. |
+ | 2026-10-19 | Save As, Export and Open no longer do nothing on Linux desktops whose file chooser portal fails to show its dialog (#2999): a "cancel" quicker than anyone could make one asks again without the parent window, then opens the built-in file browser. |
+ | 2026-10-18 | Long navigation headings wrap onto further lines inside the resizable pane instead of ending in an ellipsis: the row grows with the text and the pane keeps its width (#759, #3015). |
+
+From 1581c288bfeeace122bb7e2462726e4c449e86ed Mon Sep 17 00:00:00 2001
+From: bmh129 <11478682+bmh129@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:44:08 -0500
+Subject: [PATCH 7/7] Linux: resize and move the window again right after a
+ resize or move
+
+BeginResize and StartDrag hand the pointer to the desktop, and the
+compositor keeps the button's release (it grabs the pointer on Wayland).
+egui then still thought the button held, so the next press on an edge or
+the title bar didn't start another resize or move until a click inside the
+window released it. window_controls::desktop_grab now notes the hand-over,
+and the raw input hook adds the primary button's release to the next
+input, once, unless that input brings one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/ui-egui/src/backstage.rs       |  2 +-
+ crates/ui-egui/src/chrome.rs          |  2 +-
+ crates/ui-egui/src/lib.rs             |  8 +++-
+ crates/ui-egui/src/window_controls.rs | 62 ++++++++++++++++++++++++++-
+ 4 files changed, 68 insertions(+), 6 deletions(-)
+
+diff --git a/crates/ui-egui/src/backstage.rs b/crates/ui-egui/src/backstage.rs
+index ac07f8424f..dce3e62c86 100644
+--- a/crates/ui-egui/src/backstage.rs
++++ b/crates/ui-egui/src/backstage.rs
+@@ -55,7 +55,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
+                 // from them as the title bar's own controls, and the rest of the band drags the window.
+                 let (band, drag) = ui.allocate_exact_size(vec2(200.0, app.mac_titlebar.height), Sense::click_and_drag());
+                 if drag.drag_started() {
+-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
++                    crate::window_controls::desktop_grab(ui.ctx(), egui::ViewportCommand::StartDrag);
+                 }
+                 // The chevron's stroke starts at the content edge.
+                 let c = back_chevron_c(band.min.x, band.center().y, app.session.view.full_screen, app.mac_titlebar.content_left);
+diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
+index 1a93a97a06..35682e458a 100644
+--- a/crates/ui-egui/src/chrome.rs
++++ b/crates/ui-egui/src/chrome.rs
+@@ -269,7 +269,7 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
+             // Drag the window by the title bar (integrated title bar on macOS).
+             let drag = ui.interact(full, ui.id().with("title_drag"), Sense::click_and_drag());
+             if drag.drag_started() {
+-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
++                window_controls::desktop_grab(ui.ctx(), egui::ViewportCommand::StartDrag);
+             }
+             if drag.double_clicked() {
+                 let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 1321d3e95f..a84bb791fb 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -2207,9 +2207,13 @@ impl WordApp {
+         }
+     }
+ 
+-    /// Read a Control-click as the right-click on macOS, then inject synthetic input events from
+-    /// the control channel (one pointer event per frame).
++    /// Give back a button release the desktop kept during a window move or resize, read a
++    /// Control-click as the right-click on macOS, then inject synthetic input events from the
++    /// control channel (one pointer event per frame).
+     pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
++        if let Some(ctx) = &self.ctx {
++            window_controls::release_after_desktop_grab(ctx, raw);
++        }
+         if cfg!(target_os = "macos") {
+             control_click_as_secondary(&mut raw.events, &mut self.control_click);
+         }
+diff --git a/crates/ui-egui/src/window_controls.rs b/crates/ui-egui/src/window_controls.rs
+index bb948afcd9..aa444b9fe0 100644
+--- a/crates/ui-egui/src/window_controls.rs
++++ b/crates/ui-egui/src/window_controls.rs
+@@ -193,6 +193,35 @@ fn paint(painter: &egui::Painter, rect: Rect, button: Button, maximized: bool, t
+     }
+ }
+ 
++/// Where [`desktop_grab`] notes that the desktop holds the pointer.
++fn grab_id() -> egui::Id {
++    egui::Id::new("window_controls_desktop_grab")
++}
++
++/// Hand the pointer to the desktop to move (`StartDrag`) or resize (`BeginResize`) the window.
++/// The desktop keeps the button's release (on Wayland the compositor grabs the pointer), so egui
++/// would still think the button held and miss the next press: an edge or the title bar then
++/// wouldn't start another resize or move until a click inside the window. The release is given
++/// back on the next input ([`release_after_desktop_grab`]).
++pub fn desktop_grab(ctx: &egui::Context, command: egui::ViewportCommand) {
++    ctx.send_viewport_cmd(command);
++    ctx.data_mut(|d| d.insert_temp(grab_id(), ()));
++    ctx.request_repaint();
++}
++
++/// After [`desktop_grab`], add the primary button's release to the next input, unless it brings
++/// one. Called from the app's raw input hook, before egui reads the input.
++pub fn release_after_desktop_grab(ctx: &egui::Context, raw: &mut egui::RawInput) {
++    if ctx.data_mut(|d| d.remove_temp::<()>(grab_id())).is_none() {
++        return;
++    }
++    let released = raw.events.iter().any(|e| matches!(e, egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed: false, .. }));
++    if !released {
++        let (pos, modifiers) = ctx.input(|i| (i.pointer.interact_pos().unwrap_or_default(), i.modifiers));
++        raw.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers });
++    }
++}
++
+ /// The height of [`backstage_header`], as the title bar's.
+ pub const HEADER: f32 = 38.0;
+ 
+@@ -207,7 +236,7 @@ pub fn backstage_header(ui: &mut egui::Ui, layout: &Layout) {
+             let full = ui.max_rect();
+             let drag = ui.interact(full, ui.id().with("header_drag"), Sense::click_and_drag());
+             if drag.drag_started() {
+-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
++                desktop_grab(ui.ctx(), egui::ViewportCommand::StartDrag);
+             }
+             if drag.double_clicked() {
+                 let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+@@ -289,7 +318,7 @@ pub fn resize_edges(ctx: &egui::Context) {
+                 let response = ui.interact(rect, ui.id().with(("edge", n)), Sense::drag()).on_hover_cursor(cursor(direction));
+                 // Sensing only drags, a drag starts on the press itself.
+                 if response.drag_started() {
+-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
++                    desktop_grab(ui.ctx(), egui::ViewportCommand::BeginResize(direction));
+                 }
+             }
+             // Without the desktop's frame or shadow, a hairline keeps the window apart from
+@@ -308,6 +337,35 @@ mod tests {
+     use super::{Button, Layout, ResizeDirection, zones};
+     use egui::{Pos2, Rect};
+ 
++    /// After the desktop takes the pointer for a move or resize, the next input releases the
++    /// button egui still thinks held, once, unless that input brings the release itself.
++    #[test]
++    fn a_desktop_grab_gives_the_button_release_back() {
++        let primary_releases = |raw: &egui::RawInput| {
++            raw.events.iter().filter(|e| matches!(e, egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed: false, .. })).count()
++        };
++        let ctx = egui::Context::default();
++        let mut raw = egui::RawInput::default();
++        super::release_after_desktop_grab(&ctx, &mut raw);
++        assert_eq!(primary_releases(&raw), 0, "nothing without a grab");
++        super::desktop_grab(&ctx, egui::ViewportCommand::BeginResize(ResizeDirection::East));
++        super::release_after_desktop_grab(&ctx, &mut raw);
++        assert_eq!(primary_releases(&raw), 1, "the release the desktop kept");
++        let mut next = egui::RawInput::default();
++        super::release_after_desktop_grab(&ctx, &mut next);
++        assert_eq!(primary_releases(&next), 0, "only once");
++        super::desktop_grab(&ctx, egui::ViewportCommand::StartDrag);
++        let mut with_release = egui::RawInput::default();
++        with_release.events.push(egui::Event::PointerButton {
++            pos: Pos2::ZERO,
++            button: egui::PointerButton::Primary,
++            pressed: false,
++            modifiers: Default::default(),
++        });
++        super::release_after_desktop_grab(&ctx, &mut with_release);
++        assert_eq!(primary_releases(&with_release), 1, "not doubled when the release arrives");
++    }
++
+     #[test]
+     fn gnome_button_layouts_parse() {
+         let close = Layout { left: vec![], right: vec![Button::Close] };
